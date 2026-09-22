@@ -458,7 +458,7 @@ func (a *App) dispatch(text string) bool {
 		a.help()
 	case "steps", "list":
 		a.listSteps()
-	case "status":
+	case "status", "servers", "hosts":
 		a.status()
 	case "quit", "exit":
 		a.quit = true
@@ -632,7 +632,7 @@ repeat [N]                       повторить шаг N (по умолча�
 retry                            после ошибки: продолжить шаг с места остановки
 skip                             после ошибки: игнорировать и идти дальше
 goto N                           перейти к шагу N и выполнить его
-steps | status                   список шагов | состояние подключений
+steps | status | servers         список шагов | серверы: адрес и подключение
 break <сервер>                   Ctrl+C команде на сервере
 quit                             выход
 Пока команда выполняется, строка «<сервер> <текст>» отправляется ей на stdin

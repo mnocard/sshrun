@@ -432,7 +432,15 @@ func (c *Conn) sftpc() (*sftp.Client, error) {
 	if c.sftp != nil {
 		return c.sftp, nil
 	}
-	sc, err := sftp.NewClient(c.cli)
+	// UseConcurrentWrites — без этого sftp.File.ReadFrom пишет пакеты по одному,
+	// ожидая подтверждения каждого (стоп-энд-вейт), из-за чего скорость на канале
+	// с заметной задержкой падает до одного пакета за RTT — на дальних серверах
+	// это и есть причина «долгой» загрузки больших файлов. С этой опцией пакеты
+	// уходят параллельно (конвейером), не дожидаясь ответа по одному.
+	sc, err := sftp.NewClient(c.cli,
+		sftp.UseConcurrentWrites(true),
+		sftp.MaxConcurrentRequestsPerFile(64),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("sftp: %w", err)
 	}

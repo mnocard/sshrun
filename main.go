@@ -9,16 +9,30 @@ import (
 )
 
 func main() {
-	cfgPath := flag.String("c", "config.json", "путь к файлу конфигурации")
+	cfgPath := flag.String("c", "config.json", "путь к файлу конфигурации (если не задан — выбор среди *config.json рядом с программой)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Использование: sshrun [-c config.json]\n")
 	}
 	flag.Parse()
+
+	explicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "c" {
+			explicit = true
+		}
+	})
+	path := *cfgPath
 	if flag.NArg() > 0 {
-		*cfgPath = flag.Arg(0)
+		path = flag.Arg(0)
+		explicit = true
+	}
+	path, err := resolveConfigPath(path, explicit)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Ошибка выбора конфига:", err)
+		os.Exit(2)
 	}
 
-	cfg, err := LoadConfig(*cfgPath)
+	cfg, err := LoadConfig(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Ошибка конфигурации:", err)
 		os.Exit(2)
@@ -52,8 +66,8 @@ func main() {
 		}
 	}()
 
-	logger.Write("SYS", "SYS", fmt.Sprintf("=== сессия начата, конфиг: %s, лог: %s ===", *cfgPath, cfg.Settings.LogFile))
-	out.Info("Конфиг: %s, лог: %s. Справка — help.", *cfgPath, cfg.Settings.LogFile)
+	logger.Write("SYS", "SYS", fmt.Sprintf("=== сессия начата, конфиг: %s, лог: %s ===", path, cfg.Settings.LogFile))
+	out.Info("Конфиг: %s, лог: %s. Справка — help.", path, cfg.Settings.LogFile)
 	app.Run()
 	app.Shutdown()
 }

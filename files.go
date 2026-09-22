@@ -9,9 +9,64 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/pkg/sftp"
 )
+
+// Ниже порога прогресс не показываем — на пачке мелких файлов он только шумит,
+// а сам файл и так загрузится за секунды.
+const progressThreshold = 8 * 1024 * 1024
+
+// countingReader считает прочитанные байты атомарно, не блокируя чтение.
+// Поле f — НЕ встроено (не анонимное): begin Go 1.22 у *os.File появился метод
+// WriteTo, и если бы мы встроили *os.File, countingReader promoted-бы его —
+// тогда io.Copy(dst, countingReader) выбрал бы src.WriteTo(dst) в обход нашего
+// Read (WriteTo не вызывает Read), и счётчик оставался бы нулевым при работающей
+// передаче. Явно реализуем только Read (со счётчиком) и Stat (чтобы sftp.File.
+// ReadFrom по-прежнему узнавал размер файла и включал быстрый конкурентный
+// путь записи — см. github.com/pkg/sftp, ReadFrom: switch по
+// interface{ Stat() (os.FileInfo, error) }). Сам подсчёт — только
+// atomic.AddInt64 поверх уже читаемых данных, поэтому на скорость передачи
+// не влияет.
+type countingReader struct {
+	f *os.File
+	n int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.f.Read(p)
+	if n > 0 {
+		atomic.AddInt64(&r.n, int64(n))
+	}
+	return n, err
+}
+
+func (r *countingReader) Stat() (os.FileInfo, error) { return r.f.Stat() }
+
+// progressTicker раз в 2 секунды печатает процент, объём и текущую скорость.
+// Работает в отдельной горутине и не влияет на скорость самой передачи.
+func progressTicker(cr *countingReader, total int64, label string, report func(string), stop <-chan struct{}) {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	last, lastAt := int64(0), time.Now()
+	for {
+		select {
+		case <-stop:
+			return
+		case now := <-t.C:
+			n := atomic.LoadInt64(&cr.n)
+			speed := float64(n-last) / now.Sub(lastAt).Seconds()
+			last, lastAt = n, now
+			pct := 100
+			if total > 0 {
+				pct = int(n * 100 / total)
+			}
+			report(fmt.Sprintf("%s: %d%% (%s из %s), %s/с", label, pct, humanSize(n), humanSize(total), humanSize(int64(speed))))
+		}
+	}
+}
 
 func humanSize(n int64) string {
 	const k = 1024
@@ -40,7 +95,7 @@ func resolveDest(sc *sftp.Client, local, remote string) string {
 	return remote
 }
 
-func copyFile(sc *sftp.Client, local, remote string) (int64, error) {
+func copyFile(sc *sftp.Client, local, remote string, report func(string)) (int64, error) {
 	src, err := os.Open(local)
 	if err != nil {
 		return 0, err
@@ -51,7 +106,17 @@ func copyFile(sc *sftp.Client, local, remote string) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", remote, err)
 	}
-	n, err := io.Copy(dst, src)
+
+	var reader io.Reader = src
+	if fi, statErr := src.Stat(); statErr == nil && report != nil && fi.Size() >= progressThreshold {
+		cr := &countingReader{f: src}
+		reader = cr
+		stop := make(chan struct{})
+		go progressTicker(cr, fi.Size(), remote, report, stop)
+		defer close(stop)
+	}
+
+	n, err := io.Copy(dst, reader)
 	if cerr := dst.Close(); err == nil {
 		err = cerr
 	}
@@ -67,7 +132,7 @@ func copyTree(sc *sftp.Client, local, remote string, report func(string)) error 
 		return err
 	}
 	if !fi.IsDir() {
-		n, err := copyFile(sc, local, remote)
+		n, err := copyFile(sc, local, remote, report)
 		if err == nil {
 			report(fmt.Sprintf("↑ %s (%s)", remote, humanSize(n)))
 		}
@@ -101,7 +166,7 @@ func copyTree(sc *sftp.Client, local, remote string, report func(string)) error 
 				return fmt.Errorf("%s: %w", rp, err)
 			}
 		case d.Type().IsRegular():
-			n, err := copyFile(sc, p, rp)
+			n, err := copyFile(sc, p, rp, report)
 			if err != nil {
 				return err
 			}
@@ -146,7 +211,7 @@ func (c *Conn) Upload(local, remote string, report func(string)) error {
 	}
 	defer sc.RemoveAll(stage)
 	item := stage + "/" + filepath.Base(filepath.Clean(local))
-	if err := copyTree(sc, local, item, func(string) {}); err != nil {
+	if err := copyTree(sc, local, item, report); err != nil {
 		return err
 	}
 	var script string
