@@ -15,6 +15,26 @@ import (
 	"github.com/pkg/sftp"
 )
 
+// reporter — куда загрузка сообщает о ходе работы: note — обычные строки журнала,
+// progress — периодическое состояние большого файла (в GUI рисуется одной полоской
+// на месте, в консоли печатается строкой).
+type reporter struct {
+	note     func(string)
+	progress func(text string, pct int)
+}
+
+func (r reporter) Note(s string) {
+	if r.note != nil {
+		r.note(s)
+	}
+}
+
+func (r reporter) Progress(text string, pct int) {
+	if r.progress != nil {
+		r.progress(text, pct)
+	}
+}
+
 // Ниже порога прогресс не показываем — на пачке мелких файлов он только шумит,
 // а сам файл и так загрузится за секунды.
 const progressThreshold = 8 * 1024 * 1024
@@ -47,7 +67,7 @@ func (r *countingReader) Stat() (os.FileInfo, error) { return r.f.Stat() }
 
 // progressTicker раз в 2 секунды печатает процент, объём и текущую скорость.
 // Работает в отдельной горутине и не влияет на скорость самой передачи.
-func progressTicker(cr *countingReader, total int64, label string, report func(string), stop <-chan struct{}) {
+func progressTicker(cr *countingReader, total int64, label string, report reporter, stop <-chan struct{}) {
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
 	last, lastAt := int64(0), time.Now()
@@ -63,7 +83,7 @@ func progressTicker(cr *countingReader, total int64, label string, report func(s
 			if total > 0 {
 				pct = int(n * 100 / total)
 			}
-			report(fmt.Sprintf("%s: %d%% (%s из %s), %s/с", label, pct, humanSize(n), humanSize(total), humanSize(int64(speed))))
+			report.Progress(fmt.Sprintf("%s: %d%% (%s из %s), %s/с", label, pct, humanSize(n), humanSize(total), humanSize(int64(speed))), pct)
 		}
 	}
 }
@@ -95,7 +115,7 @@ func resolveDest(sc *sftp.Client, local, remote string) string {
 	return remote
 }
 
-func copyFile(sc *sftp.Client, local, remote string, report func(string)) (int64, error) {
+func copyFile(sc *sftp.Client, local, remote string, report reporter) (int64, error) {
 	src, err := os.Open(local)
 	if err != nil {
 		return 0, err
@@ -108,7 +128,7 @@ func copyFile(sc *sftp.Client, local, remote string, report func(string)) (int64
 	}
 
 	var reader io.Reader = src
-	if fi, statErr := src.Stat(); statErr == nil && report != nil && fi.Size() >= progressThreshold {
+	if fi, statErr := src.Stat(); statErr == nil && report.progress != nil && fi.Size() >= progressThreshold {
 		cr := &countingReader{f: src}
 		reader = cr
 		stop := make(chan struct{})
@@ -126,7 +146,7 @@ func copyFile(sc *sftp.Client, local, remote string, report func(string)) (int64
 	return n, err
 }
 
-func copyTree(sc *sftp.Client, local, remote string, report func(string)) error {
+func copyTree(sc *sftp.Client, local, remote string, report reporter) error {
 	fi, err := os.Stat(local)
 	if err != nil {
 		return err
@@ -134,7 +154,7 @@ func copyTree(sc *sftp.Client, local, remote string, report func(string)) error 
 	if !fi.IsDir() {
 		n, err := copyFile(sc, local, remote, report)
 		if err == nil {
-			report(fmt.Sprintf("↑ %s (%s)", remote, humanSize(n)))
+			report.Note(fmt.Sprintf("↑ %s (%s)", remote, humanSize(n)))
 		}
 		return err
 	}
@@ -173,22 +193,22 @@ func copyTree(sc *sftp.Client, local, remote string, report func(string)) error 
 			files++
 			bytes += n
 			if total <= 30 || files%50 == 0 {
-				report(fmt.Sprintf("↑ %s (%s) [%d/%d]", rp, humanSize(n), files, total))
+				report.Note(fmt.Sprintf("↑ %s (%s) [%d/%d]", rp, humanSize(n), files, total))
 			}
 		default:
-			report("пропущен не обычный файл: " + p)
+			report.Note("пропущен не обычный файл: " + p)
 		}
 		return nil
 	})
 	if err == nil {
-		report(fmt.Sprintf("каталог загружен: %d файл(ов), %s", files, humanSize(bytes)))
+		report.Note(fmt.Sprintf("каталог загружен: %d файл(ов), %s", files, humanSize(bytes)))
 	}
 	return err
 }
 
 // Upload загружает файл или каталог. При нехватке прав и default_sudo — через
 // временный каталог в /tmp и «sudo cp».
-func (c *Conn) Upload(local, remote string, report func(string)) error {
+func (c *Conn) Upload(local, remote string, report reporter) error {
 	if _, err := os.Stat(local); err != nil {
 		return err
 	}
@@ -203,7 +223,7 @@ func (c *Conn) Upload(local, remote string, report func(string)) error {
 		return err
 	}
 
-	report("недостаточно прав на запись — загрузка через /tmp и sudo cp")
+	report.Note("недостаточно прав на запись — загрузка через /tmp и sudo cp")
 	fi, _ := os.Stat(local)
 	stage := "/tmp/.sshrun-" + randHex(6)
 	if err := sc.Mkdir(stage); err != nil {
@@ -223,7 +243,7 @@ func (c *Conn) Upload(local, remote string, report func(string)) error {
 	if _, se, err := c.runSilent("sh -c "+shQuote(script), true); err != nil {
 		return fmt.Errorf("sudo cp: %v: %s", err, strings.TrimSpace(se))
 	}
-	report("загружено в " + dst + " (через sudo, владелец — root)")
+	report.Note("загружено в " + dst + " (через sudo, владелец — root)")
 	return nil
 }
 

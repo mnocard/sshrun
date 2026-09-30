@@ -46,6 +46,10 @@ type Conn struct {
 	curLine  string
 	answered bool
 
+	busySince time.Time // когда началась текущая команда (для GUI)
+	busyCmd   string    // её краткий текст
+	onChange  func()    // вызывается при смене состояния (команда началась/закончилась, связь потеряна)
+
 	execMu   sync.Mutex // одна команда за раз
 	closed   chan struct{}
 	closeErr error
@@ -108,7 +112,7 @@ func authMethods(cfg ServerCfg) ([]ssh.AuthMethod, error) {
 	return auth, nil
 }
 
-func Connect(cfg ServerCfg, timeout time.Duration, sudo bool, out *Console) (*Conn, error) {
+func Connect(cfg ServerCfg, timeout time.Duration, sudo bool, out *Console, onChange func()) (*Conn, error) {
 	auth, err := authMethods(cfg)
 	if err != nil {
 		return nil, err
@@ -121,10 +125,23 @@ func Connect(cfg ServerCfg, timeout time.Duration, sudo bool, out *Console) (*Co
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         timeout,
 	}
-	cli, err := ssh.Dial("tcp", net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)), cc)
+	// Свой Dial вместо ssh.Dial: (1) TCP keepalive на уровне сокета — NAT/файрволы не
+	// «забывают» соединение во время многоминутных команд без вывода; (2) connect_timeout
+	// ограничивает и рукопожатие с аутентификацией, а не только установку TCP.
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+	d := net.Dialer{Timeout: timeout, KeepAlive: 15 * time.Second}
+	nc, err := d.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
+	nc.SetDeadline(time.Now().Add(timeout))
+	sconn, chans, reqs, err := ssh.NewClientConn(nc, addr, cc)
+	if err != nil {
+		nc.Close()
+		return nil, err
+	}
+	nc.SetDeadline(time.Time{})
+	cli := ssh.NewClient(sconn, chans, reqs)
 	sess, err := cli.NewSession()
 	if err != nil {
 		cli.Close()
@@ -155,7 +172,7 @@ func Connect(cfg ServerCfg, timeout time.Duration, sudo bool, out *Console) (*Co
 	c := &Conn{
 		name: cfg.Name, cfg: cfg, sudo: sudo, out: out,
 		cli: cli, sess: sess, stdin: stdin,
-		closed: make(chan struct{}),
+		closed: make(chan struct{}), onChange: onChange,
 	}
 	go c.readLoop(stdout)
 	go c.keepAlive()
@@ -189,17 +206,62 @@ func (c *Conn) Alive() bool {
 	}
 }
 
+// Параметры keepalive (переменные — чтобы можно было сократить в тестах).
+var (
+	kaInterval = 15 * time.Second // как часто спрашивать сервер
+	kaTimeout  = 30 * time.Second // сколько ждать ответ на один запрос
+	kaMaxMiss  = 3                // сколько подряд неотвеченных запросов считаем обрывом связи
+)
+
+// keepAlive поддерживает соединение во время долгих команд и заодно замечает обрыв:
+// если сервер не отвечает kaMaxMiss раз подряд, соединение закрывается — выполняющаяся
+// команда завершается ошибкой (шаг приостанавливается), а не висит бесконечно.
 func (c *Conn) keepAlive() {
-	t := time.NewTicker(30 * time.Second)
+	t := time.NewTicker(kaInterval)
 	defer t.Stop()
+	miss := 0
 	for {
 		select {
 		case <-c.closed:
 			return
 		case <-t.C:
-			c.cli.SendRequest("keepalive@openssh.com", true, nil)
+		}
+		res := make(chan error, 1)
+		go func() {
+			_, _, err := c.cli.SendRequest("keepalive@openssh.com", true, nil)
+			res <- err
+		}()
+		select {
+		case err := <-res:
+			if err != nil {
+				return // транспорт уже упал — readLoop сам всё закроет
+			}
+			miss = 0
+		case <-time.After(kaTimeout):
+			miss++
+			if miss >= kaMaxMiss {
+				c.out.Note(c.name, "сервер не отвечает на keepalive (%d раз подряд) — соединение закрыто", miss)
+				c.cli.Close()
+				return
+			}
+		case <-c.closed:
+			return
 		}
 	}
+}
+
+// changed сообщает наверх, что состояние соединения изменилось.
+func (c *Conn) changed() {
+	if c.onChange != nil {
+		c.onChange()
+	}
+}
+
+// BusyInfo — выполняется ли команда, с какого момента и какая.
+func (c *Conn) BusyInfo() (busy bool, since time.Time, cmd string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.waiter != nil, c.busySince, c.busyCmd
 }
 
 // completeUTF8 возвращает длину префикса b, не обрывающегося посреди UTF-8 символа.
@@ -260,6 +322,7 @@ func (c *Conn) readLoop(r io.Reader) {
 	if !c.closing.Load() {
 		c.out.Note(c.name, "соединение закрыто сервером")
 	}
+	c.changed()
 }
 
 // feed разбирает поток: отделяет маркер завершения команды от обычного вывода.
@@ -367,6 +430,7 @@ func (c *Conn) Exec(cmd string) (int, error) { return c.exec(cmd, 0) }
 func (c *Conn) exec(cmd string, timeout time.Duration) (int, error) {
 	c.execMu.Lock()
 	defer c.execMu.Unlock()
+	defer c.changed() // выполняется до Unlock: после завершения команды состояние обновится
 	if !c.Alive() {
 		return 0, errors.New("нет соединения с сервером")
 	}
@@ -374,8 +438,10 @@ func (c *Conn) exec(cmd string, timeout time.Duration) (int, error) {
 	w := &waiter{prefix: "__SR_" + id + "_", done: make(chan int, 1)}
 	c.mu.Lock()
 	c.waiter = w
+	c.busySince, c.busyCmd = time.Now(), oneLine(cmd)
 	c.curLine, c.answered = "", false // остатки прошлого вывода (например, приглашения) не мешают
 	c.mu.Unlock()
+	c.changed()
 
 	// Команда и маркер уходят одним составным оператором «{ cmd \n }; printf ...».
 	// Bash разбирает его целиком ДО запуска, поэтому в буфере терминала не остаётся

@@ -16,6 +16,7 @@ type ServerCfg struct {
 	Password string `json:"password"`
 	KeyFile  string `json:"key_file"`
 	KeyPass  string `json:"key_passphrase"`
+	Color    string `json:"color"` // цвет метки сервера в GUI (CSS-цвет); по умолчанию — автоматически
 }
 
 type Settings struct {
@@ -55,11 +56,75 @@ type Step struct {
 	Entries     []Entry `json:"servers"`
 }
 
-type Config struct {
-	Servers  []ServerCfg `json:"servers"`
-	Settings Settings    `json:"settings"`
-	Workflow []Step      `json:"workflow"`
+// HighlightRule — правило подсветки вывода в GUI.
+// Pattern — подстрока (или регулярное выражение JavaScript при regex=true).
+// Scope: "match" (по умолчанию) — красится только найденный текст,
+// "line" — красится вся строка. Kinds ограничивает типы строк
+// (out, err, sys, info, cmd, in); по умолчанию — out, err, sys, info.
+type HighlightRule struct {
+	Pattern    string   `json:"pattern"`
+	Regex      bool     `json:"regex,omitempty"`
+	IgnoreCase *bool    `json:"ignore_case,omitempty"` // по умолчанию true
+	Color      string   `json:"color,omitempty"`
+	Background string   `json:"background,omitempty"`
+	Bold       bool     `json:"bold,omitempty"`
+	Italic     bool     `json:"italic,omitempty"`
+	Underline  bool     `json:"underline,omitempty"`
+	Scope      string   `json:"scope,omitempty"`
+	Kinds      []string `json:"kinds,omitempty"`
 }
+
+type HighlightCfg struct {
+	Enabled         *bool           `json:"enabled"`          // false — подсветка выключена совсем
+	IncludeDefaults bool            `json:"include_defaults"` // добавить встроенные правила после своих
+	Rules           []HighlightRule `json:"rules"`
+}
+
+type GUICfg struct {
+	FontSize   int   `json:"font_size"`  // размер шрифта вывода, px (по умолчанию 13)
+	MaxLines   int   `json:"max_lines"`  // сколько строк держать в окне (по умолчанию 20000; лог-файл полный)
+	Timestamps *bool `json:"timestamps"` // показывать время у строк (по умолчанию true)
+}
+
+type Config struct {
+	Servers   []ServerCfg   `json:"servers"`
+	Settings  Settings      `json:"settings"`
+	Workflow  []Step        `json:"workflow"`
+	Highlight *HighlightCfg `json:"highlight"`
+	GUI       GUICfg        `json:"gui"`
+}
+
+// defaultHighlightRules — встроенные правила, если в конфиге нет своих.
+func defaultHighlightRules() []HighlightRule {
+	return []HighlightRule{
+		{Pattern: `\b(error|errors|fail|failed|failure|fails|fatal|panic|exception|traceback|denied|refused|unreachable|critical)\b|no such file|not found|cannot |can't |unable to|timed? ?out|ошибк[а-яё]*|не удалось|отказано|не найден[а-яё]*`, Regex: true, Color: "#ff6b6b", Bold: true},
+		{Pattern: `\b(warn|warning|warnings|deprecated)\b|предупрежден[а-яё]*`, Regex: true, Color: "#f0c05a", Bold: true},
+		{Pattern: `\b(success|successful|successfully|done|passed|healthy|finished|completed)\b|успешно|готово|выполнено`, Regex: true, Color: "#5fd38d"},
+		{Pattern: `unhealthy|Exited \(\d+\)|Restarting|\bDead\b`, Regex: true, Color: "#ff9f43"},
+	}
+}
+
+// HighlightEffective возвращает итоговый набор правил: свои правила заменяют встроенные
+// (если не задан include_defaults); без раздела highlight действуют встроенные.
+func (c *Config) HighlightEffective() (bool, []HighlightRule) {
+	h := c.Highlight
+	if h == nil {
+		return true, defaultHighlightRules()
+	}
+	if h.Enabled != nil && !*h.Enabled {
+		return false, nil
+	}
+	if len(h.Rules) == 0 {
+		return true, defaultHighlightRules()
+	}
+	rules := append([]HighlightRule(nil), h.Rules...)
+	if h.IncludeDefaults {
+		rules = append(rules, defaultHighlightRules()...)
+	}
+	return true, rules
+}
+
+var highlightKinds = map[string]bool{"out": true, "err": true, "sys": true, "info": true, "cmd": true, "in": true}
 
 // Action — одно атомарное действие на сервере.
 type Action struct {
@@ -95,7 +160,7 @@ func (e Entry) Actions() []Action {
 var reserved = map[string]bool{
 	"help": true, "steps": true, "list": true, "status": true, "quit": true, "exit": true,
 	"repeat": true, "goto": true, "retry": true, "skip": true, "break": true,
-	"edit": true, "upload": true, "all": true, "*": true,
+	"edit": true, "upload": true, "all": true, "*": true, "servers": true, "hosts": true,
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -119,6 +184,43 @@ func LoadConfig(path string) (*Config, error) {
 	if s.PauseOnEnter == nil {
 		t := true
 		s.PauseOnEnter = &t
+	}
+
+	g := &cfg.GUI
+	if g.FontSize == 0 {
+		g.FontSize = 13
+	}
+	if g.FontSize < 9 || g.FontSize > 32 {
+		return nil, fmt.Errorf("gui.font_size должен быть от 9 до 32")
+	}
+	if g.MaxLines == 0 {
+		g.MaxLines = 20000
+	}
+	if g.MaxLines < 500 {
+		g.MaxLines = 500
+	}
+	if g.Timestamps == nil {
+		t := true
+		g.Timestamps = &t
+	}
+	if cfg.Highlight != nil {
+		for i, r := range cfg.Highlight.Rules {
+			where := fmt.Sprintf("highlight.rules[%d]", i)
+			if r.Pattern == "" {
+				return nil, fmt.Errorf("%s: не задан pattern", where)
+			}
+			if r.Scope != "" && r.Scope != "match" && r.Scope != "line" {
+				return nil, fmt.Errorf("%s: scope должен быть \"match\" или \"line\"", where)
+			}
+			for _, k := range r.Kinds {
+				if !highlightKinds[k] {
+					return nil, fmt.Errorf("%s: неизвестный тип строки %q (допустимо: out, err, sys, info, cmd, in)", where, k)
+				}
+			}
+			if r.Color == "" && r.Background == "" && !r.Bold && !r.Italic && !r.Underline {
+				return nil, fmt.Errorf("%s: правило ничего не меняет — задайте color, background, bold, italic или underline", where)
+			}
+		}
 	}
 
 	if len(cfg.Servers) == 0 {

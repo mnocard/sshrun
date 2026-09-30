@@ -10,8 +10,11 @@ import (
 
 func main() {
 	cfgPath := flag.String("c", "config.json", "путь к файлу конфигурации (если не задан — выбор среди *config.json рядом с программой)")
+	cli := flag.Bool("cli", false, "консольный режим без графического интерфейса")
+	port := flag.Int("port", 0, "порт локального веб-интерфейса (по умолчанию — случайный свободный)")
+	noBrowser := flag.Bool("no-browser", false, "не открывать окно автоматически, только вывести адрес")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Использование: sshrun [-c config.json]\n")
+		fmt.Fprintf(os.Stderr, "Использование: sshrun [-cli] [-c config.json] [-port N] [-no-browser]\n")
 	}
 	flag.Parse()
 
@@ -26,6 +29,16 @@ func main() {
 		path = flag.Arg(0)
 		explicit = true
 	}
+
+	if *cli {
+		runCLI(path, explicit)
+		return
+	}
+	runGUI(path, explicit, *port, *noBrowser)
+}
+
+// runCLI — консольный режим (как в первых версиях программы).
+func runCLI(path string, explicit bool) {
 	path, err := resolveConfigPath(path, explicit)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Ошибка выбора конфига:", err)
@@ -58,8 +71,7 @@ func main() {
 		for range sig {
 			if !last.IsZero() && time.Since(last) < 3*time.Second {
 				out.Info("Принудительный выход")
-				app.Shutdown()
-				os.Exit(130)
+				app.exit(130)
 			}
 			last = time.Now()
 			out.Info("Ctrl+C: нажмите ещё раз в течение 3 с для выхода. Прервать команду на сервере: break <сервер>")

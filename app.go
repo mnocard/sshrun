@@ -34,13 +34,36 @@ type Input struct {
 	eof     bool
 }
 
+// NewInput — ввод из потока (консольный режим).
 func NewInput(r io.Reader) *Input {
-	in := &Input{req: make(chan struct{}, 1), ch: make(chan inputLine, 1)}
 	br := bufio.NewReader(r)
+	return newInput(func() (string, error) {
+		s, err := br.ReadString('\n')
+		if err != nil && s == "" {
+			return "", err
+		}
+		return s, nil
+	})
+}
+
+// NewChanInput — ввод из канала (GUI): каждая строка канала — как введённая строка
+// с Enter (пустая строка — просто Enter). Закрытие канала — конец ввода.
+func NewChanInput(ch <-chan string) *Input {
+	return newInput(func() (string, error) {
+		s, ok := <-ch
+		if !ok {
+			return "", io.EOF
+		}
+		return s + "\n", nil
+	})
+}
+
+func newInput(read func() (string, error)) *Input {
+	in := &Input{req: make(chan struct{}, 1), ch: make(chan inputLine, 1)}
 	go func() {
 		for range in.req {
-			s, err := br.ReadString('\n')
-			if err != nil && s == "" {
+			s, err := read()
+			if err != nil {
 				in.ch <- inputLine{err: err}
 				return
 			}
@@ -79,8 +102,11 @@ func (in *Input) Wait(done <-chan struct{}) (l inputLine, finished bool) {
 
 type srvState struct {
 	cfg  ServerCfg
-	mu   sync.Mutex
+	mu   sync.Mutex // держится на время подключения — для быстрых чтений см. cur/connecting
 	conn *Conn
+
+	cur        atomic.Pointer[Conn] // то же подключение, но читается без блокировок (для GUI)
+	connecting atomic.Bool
 }
 
 type progress struct {
@@ -102,30 +128,78 @@ type App struct {
 	in  *Input
 	srv map[string]*srvState
 
-	cur     int      // индекс следующего шага
-	last    *stepRun // последний запущенный шаг
-	blocked *stepRun // шаг с неустранёнными ошибками
-	quit    bool
+	// Поля ниже меняются только под stateMu (читаются также из GUI-горутин).
+	stateMu  sync.Mutex
+	cur      int      // индекс следующего шага
+	last     *stepRun // последний запущенный шаг
+	blocked  *stepRun // шаг с неустранёнными ошибками
+	mode     string   // running | prompt | blocked | end
+	stepStat []string // pending | running | done | failed | skipped
+	runs     map[int]*stepRun
+
+	quit         bool
+	endAnnounced bool
+	closed       atomic.Bool
+	shutOnce     sync.Once
+
+	// Хуки для GUI (в консольном режиме nil).
+	OnState    func()                    // состояние изменилось
+	OnExit     func()                    // программа сейчас завершится
+	OpenEditor func(server, path string) // открыть встроенный редактор вместо внешнего
 }
 
 func NewApp(cfg *Config, log *Logger, out *Console, in *Input) *App {
-	a := &App{cfg: cfg, log: log, out: out, in: in, srv: map[string]*srvState{}}
+	a := &App{cfg: cfg, log: log, out: out, in: in, srv: map[string]*srvState{},
+		mode: "running", runs: map[int]*stepRun{}}
+	a.stepStat = make([]string, len(cfg.Workflow))
+	for i := range a.stepStat {
+		a.stepStat[i] = "pending"
+	}
 	for _, s := range cfg.Servers {
 		a.srv[s.Name] = &srvState{cfg: s}
 	}
 	return a
 }
 
-func (a *App) Shutdown() {
-	for _, s := range a.srv {
-		s.mu.Lock()
-		if s.conn != nil {
-			s.conn.Close()
-		}
-		s.mu.Unlock()
+// st выполняет f под stateMu.
+func (a *App) st(f func()) {
+	a.stateMu.Lock()
+	f()
+	a.stateMu.Unlock()
+}
+
+func (a *App) notify() {
+	if a.OnState != nil {
+		a.OnState()
 	}
-	a.log.Write("SYS", "SYS", "=== сессия завершена ===")
-	a.log.Close()
+}
+
+func (a *App) setMode(m string) {
+	a.st(func() { a.mode = m })
+	a.notify()
+}
+
+// Shutdown закрывает все соединения и лог. Можно вызывать повторно.
+func (a *App) Shutdown() {
+	a.shutOnce.Do(func() {
+		a.closed.Store(true)
+		for _, s := range a.srv {
+			if c := s.cur.Load(); c != nil { // без s.mu: он может быть занят долгим подключением
+				c.Close()
+			}
+		}
+		a.log.Write("SYS", "SYS", "=== сессия завершена ===")
+		a.log.Close()
+	})
+}
+
+// exit завершает программу (с оповещением GUI).
+func (a *App) exit(code int) {
+	if a.OnExit != nil {
+		a.OnExit()
+	}
+	a.Shutdown()
+	os.Exit(code)
 }
 
 // conn возвращает живое подключение, при необходимости (пере)подключаясь.
@@ -136,6 +210,9 @@ func (a *App) conn(name string) (*Conn, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if a.closed.Load() {
+		return nil, fmt.Errorf("программа завершает работу")
+	}
 	if s.conn != nil {
 		if s.conn.Alive() {
 			return s.conn, nil
@@ -143,14 +220,25 @@ func (a *App) conn(name string) (*Conn, error) {
 		a.out.Note(name, "соединение потеряно, переподключаюсь…")
 		s.conn.Close()
 		s.conn = nil
+		s.cur.Store(nil)
 	}
 	a.out.Note(name, "подключение к %s@%s:%d …", s.cfg.Username, s.cfg.Host, s.cfg.Port)
-	c, err := Connect(s.cfg, time.Duration(a.cfg.Settings.ConnectTimeout)*time.Second, a.cfg.Settings.DefaultSudo, a.out)
+	s.connecting.Store(true)
+	a.notify()
+	c, err := Connect(s.cfg, time.Duration(a.cfg.Settings.ConnectTimeout)*time.Second, a.cfg.Settings.DefaultSudo, a.out, a.notify)
+	s.connecting.Store(false)
 	if err != nil {
+		a.notify()
 		return nil, fmt.Errorf("не удалось подключиться: %w", err)
 	}
 	s.conn = c
+	s.cur.Store(c)
+	if a.closed.Load() { // Shutdown мог пройти, пока мы подключались
+		c.Close()
+		return nil, fmt.Errorf("программа завершает работу")
+	}
 	a.out.Note(name, "подключено")
+	a.notify()
 	return c, nil
 }
 
@@ -184,7 +272,11 @@ func (a *App) doAction(name string, act Action) error {
 		a.out.Note(name, "-- готово (код 0)")
 	case "upload":
 		a.out.Note(name, "загрузка %s -> %s", act.Upload.Local, act.Upload.Remote)
-		if err := c.Upload(act.Upload.Local, act.Upload.Remote, func(s string) { a.out.Note(name, "%s", s) }); err != nil {
+		rep := reporter{
+			note:     func(s string) { a.out.Note(name, "%s", s) },
+			progress: func(text string, pct int) { a.out.Progress(name, text, pct) },
+		}
+		if err := c.Upload(act.Upload.Local, act.Upload.Remote, rep); err != nil {
 			return fmt.Errorf("загрузка: %w", err)
 		}
 		a.out.Note(name, "-- загрузка завершена")
@@ -208,6 +300,7 @@ func (a *App) doAction(name string, act Action) error {
 // Пока идёт выполнение, строки пользователя вида «сервер текст» уходят на stdin
 // выполняющейся команды на этом сервере, «break сервер» посылает Ctrl+C.
 func (a *App) runParallel(names []string, fn func(string) error) map[string]error {
+	a.setMode("running")
 	errs := map[string]error{}
 	var emu sync.Mutex
 	var wg sync.WaitGroup
@@ -249,8 +342,7 @@ func (a *App) handleRunInput(text string) {
 	switch strings.ToLower(first) {
 	case "quit", "exit":
 		a.out.Info("Выход по запросу пользователя")
-		a.Shutdown()
-		os.Exit(0)
+		a.exit(0)
 	case "break":
 		if c := a.liveConn(rest); c != nil {
 			c.Interrupt()
@@ -333,21 +425,28 @@ func (a *App) runStep(sr *stepRun) bool {
 			targets = append(targets, n)
 		}
 	}
+	a.st(func() {
+		a.runs[sr.idx] = sr
+		a.stepStat[sr.idx] = "running"
+	})
+	a.notify()
 	var stop atomic.Bool
 	a.runParallel(targets, func(n string) error {
 		p := sr.prog[n]
-		p.err = nil
+		a.st(func() { p.err = nil })
 		for p.next < len(p.actions) {
 			if stop.Load() {
 				return nil
 			}
 			if err := a.doAction(n, p.actions[p.next]); err != nil {
-				p.err = err
+				a.st(func() { p.err = err })
 				stop.Store(true)
 				a.out.Err(n, "%v", err)
+				a.notify()
 				return err
 			}
-			p.next++
+			a.st(func() { p.next++ })
+			a.notify()
 		}
 		return nil
 	})
@@ -364,8 +463,12 @@ func (a *App) runStep(sr *stepRun) bool {
 	}
 	if len(failed) == 0 && len(waiting) == 0 {
 		a.out.Info("Шаг %d «%s» выполнен на всех серверах", sr.idx+1, st.Name)
+		a.st(func() { a.stepStat[sr.idx] = "done" })
+		a.notify()
 		return true
 	}
+	a.st(func() { a.stepStat[sr.idx] = "failed" })
+	a.notify()
 	a.out.Info("!!! Шаг %d «%s» ПРИОСТАНОВЛЕН из-за ошибок:", sr.idx+1, st.Name)
 	for _, f := range failed {
 		a.out.Info("      %s", f)
@@ -382,32 +485,35 @@ func (a *App) wantPause() bool {
 	return *a.cfg.Settings.PauseOnEnter || a.cfg.Settings.PressAnyKey
 }
 
-// Run — главный цикл.
+// Run — главный цикл. После последнего шага программа НЕ завершается: она остаётся
+// в диалоге (можно повторить шаг, выполнить команды) до quit / закрытия ввода.
 func (a *App) Run() {
 	for !a.quit {
 		if a.cur >= len(a.cfg.Workflow) {
-			a.out.Info("")
-			a.out.Info("Все шаги выполнены.")
-			return
+			a.promptLoop() // вернётся только при quit или goto
+			continue
 		}
 		idx := a.cur
-		a.cur++
+		a.st(func() { a.cur++ })
 		sr := a.newStepRun(idx)
 		a.announce(idx)
 		a.finishRun(sr, a.runStep(sr))
-		if a.blocked != nil || a.wantPause() {
+		if a.blocked != nil || a.wantPause() || a.cur >= len(a.cfg.Workflow) {
 			a.promptLoop()
 		}
 	}
 }
 
 func (a *App) finishRun(sr *stepRun, ok bool) {
-	a.last = sr
-	if !ok {
-		a.blocked = sr
-	} else if a.blocked != nil && a.blocked.idx == sr.idx {
-		a.blocked = nil
-	}
+	a.st(func() {
+		a.last = sr
+		if !ok {
+			a.blocked = sr
+		} else if a.blocked != nil && a.blocked.idx == sr.idx {
+			a.blocked = nil
+		}
+	})
+	a.notify()
 }
 
 // ---------- диалог с пользователем ----------
@@ -417,7 +523,7 @@ func (a *App) promptText() string {
 	case a.blocked != nil:
 		return fmt.Sprintf("\n[ОШИБКА в шаге %d] retry / repeat / skip / <сервер> <команда> > ", a.blocked.idx+1)
 	case a.cur >= len(a.cfg.Workflow):
-		return "\n[конец] Enter — завершить, help — справка > "
+		return "\n[конец] все шаги выполнены; help — справка, quit — выход > "
 	default:
 		return fmt.Sprintf("\n[след. шаг %d/%d «%s»] Enter — выполнить, help — справка > ",
 			a.cur+1, len(a.cfg.Workflow), a.cfg.Workflow[a.cur].Name)
@@ -428,6 +534,21 @@ func (a *App) promptText() string {
 // Возвращается, когда можно двигаться дальше (или при quit / goto).
 func (a *App) promptLoop() {
 	for !a.quit {
+		end := a.blocked == nil && a.cur >= len(a.cfg.Workflow)
+		if end && !a.endAnnounced {
+			a.endAnnounced = true
+			a.out.Info("")
+			a.out.Info("Все шаги выполнены. Программа продолжает работу: repeat N — повторить шаг, goto N — перейти к шагу,")
+			a.out.Info("<сервер> <команда> — выполнить команду, quit — выход.")
+		}
+		switch {
+		case a.blocked != nil:
+			a.setMode("blocked")
+		case end:
+			a.setMode("end")
+		default:
+			a.setMode("prompt")
+		}
 		a.out.Prompt(a.promptText())
 		l, _ := a.in.Wait(nil)
 		if l.err != nil {
@@ -440,6 +561,10 @@ func (a *App) promptLoop() {
 		if text == "" {
 			if a.blocked != nil {
 				a.out.Info("Есть неустранённые ошибки — продолжать нельзя. retry / repeat / skip (help — справка).")
+				continue
+			}
+			if a.cur >= len(a.cfg.Workflow) {
+				a.out.Info("Все шаги уже выполнены. Введите команду (help — справка) или quit для выхода.")
 				continue
 			}
 			return
@@ -470,8 +595,11 @@ func (a *App) dispatch(text string) bool {
 			a.out.Info("Использование: goto <номер шага 1..%d>", len(a.cfg.Workflow))
 			break
 		}
-		a.cur = n - 1
-		a.blocked = nil
+		a.st(func() {
+			a.cur = n - 1
+			a.blocked = nil
+		})
+		a.endAnnounced = false
 		return true
 
 	case "repeat":
@@ -510,7 +638,11 @@ func (a *App) dispatch(text string) bool {
 			break
 		}
 		a.out.Info("Ошибки шага %d проигнорированы по решению пользователя", a.blocked.idx+1)
-		a.blocked = nil
+		a.st(func() {
+			a.stepStat[a.blocked.idx] = "skipped"
+			a.blocked = nil
+		})
+		a.notify()
 
 	case "break":
 		if c := a.liveConn(rest); c != nil {
@@ -523,6 +655,10 @@ func (a *App) dispatch(text string) bool {
 		args := splitArgs(rest)
 		if len(args) != 2 || a.srv[args[0]] == nil {
 			a.out.Info("Использование: edit <сервер> <путь к файлу на сервере>")
+			break
+		}
+		if a.OpenEditor != nil { // GUI: встроенный редактор
+			a.OpenEditor(args[0], args[1])
 			break
 		}
 		if err := a.edit(args[0], args[1]); err != nil {

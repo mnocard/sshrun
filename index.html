@@ -1,0 +1,728 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sshrun</title>
+<style>
+:root{
+  --bg:#12151c; --panel:#181c26; --panel2:#1f2430; --border:#2a3040;
+  --text:#d6dae3; --dim:#838ea3; --accent:#4d8dff; --danger:#ff5f5f;
+  --good:#4ddc8a; --warn:#f0b64d; --console-font-size:13px;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{
+  background:var(--bg); color:var(--text);
+  font:14px/1.4 -apple-system,Segoe UI,Roboto,Arial,sans-serif;
+  display:flex; flex-direction:column;
+}
+button{
+  font:inherit; color:var(--text); background:var(--panel2);
+  border:1px solid var(--border); border-radius:6px; padding:6px 10px;
+  cursor:pointer;
+}
+button:hover{border-color:var(--accent)}
+button:disabled{opacity:.45;cursor:default;border-color:var(--border)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#0a0d12;font-weight:600}
+button.danger{border-color:var(--danger)}
+button.danger:hover{background:var(--danger);color:#12151c}
+input,select,textarea{
+  font:inherit; color:var(--text); background:var(--panel2);
+  border:1px solid var(--border); border-radius:6px; padding:6px 8px;
+}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
+.dim{color:var(--dim)}
+.hidden{display:none !important}
+.spacer{flex:1}
+
+/* ---- header ---- */
+#topbar{
+  height:48px; flex:0 0 auto; display:flex; align-items:center; gap:10px;
+  padding:0 12px; background:var(--panel); border-bottom:1px solid var(--border);
+}
+#topbar .brand{font-weight:700;letter-spacing:.3px}
+#cfginfo{color:var(--dim);font-size:13px}
+#conn-dot{width:8px;height:8px;border-radius:50%;background:var(--dim)}
+#conn-dot.on{background:var(--good)}
+#topbar a#btn-log{color:var(--text);text-decoration:none;font-size:13px;padding:6px 10px;border:1px solid var(--border);border-radius:6px}
+#topbar a#btn-log:hover{border-color:var(--accent)}
+#topbar a#btn-log.hidden{display:none}
+
+/* ---- overlays ---- */
+.overlay{
+  position:fixed; inset:0; background:rgba(6,8,12,.72);
+  display:flex; align-items:center; justify-content:center; z-index:50;
+}
+.overlay .box{
+  width:520px; max-width:92vw; max-height:86vh; overflow:auto;
+  background:var(--panel); border:1px solid var(--border); border-radius:10px;
+  padding:20px 22px;
+}
+.overlay .box.wide{width:820px}
+.overlay h2{margin:0 0 14px;font-size:16px}
+.err-box{
+  background:#2a1418; border:1px solid var(--danger); color:#ffb3b3;
+  border-radius:6px; padding:8px 10px; margin-bottom:12px; font-size:13px; white-space:pre-wrap;
+}
+
+/* ---- config picker ---- */
+#picker-list{display:flex;flex-direction:column;gap:6px;margin-bottom:14px;max-height:40vh;overflow:auto}
+.cfg-item{
+  display:flex; justify-content:space-between; gap:10px; text-align:left;
+  width:100%; padding:9px 10px;
+}
+.cfg-name{font-weight:600}
+.cfg-dir{color:var(--dim);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px}
+.picker-manual{display:flex;gap:8px;margin-bottom:10px}
+.picker-manual input{flex:1}
+
+/* ---- main layout ---- */
+#main{flex:1;display:flex;min-height:0}
+#sidebar{
+  width:300px; flex:0 0 auto; background:var(--panel); border-right:1px solid var(--border);
+  display:flex; flex-direction:column; overflow:auto;
+}
+#sidebar h3{margin:0;padding:10px 12px 6px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim)}
+
+.srow{
+  display:flex; flex-wrap:wrap; align-items:center; gap:6px;
+  padding:7px 12px; border-bottom:1px solid var(--border); font-size:13px;
+}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--dim);flex:0 0 auto}
+.st-idle .dot{background:var(--good)}
+.st-busy .dot{background:var(--accent);animation:pulse 1.1s infinite}
+.st-connecting .dot{background:var(--warn);animation:pulse 1.1s infinite}
+.st-disconnected .dot{background:var(--dim)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.tag{
+  display:inline-block; padding:1px 7px; border-radius:4px; font-weight:600;
+  font-size:12px; color:#0a0d12;
+}
+.tag.mini{font-size:11px;padding:0 5px}
+.addr{color:var(--dim);font-size:12px}
+.stlabel{color:var(--dim);font-size:12px}
+.srow-cmd{
+  flex-basis:100%; font-family:ui-monospace,Consolas,monospace; font-size:12px;
+  color:var(--text); background:var(--panel2); border-radius:4px; padding:3px 6px;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.srow-time{color:var(--warn);font-size:12px;font-variant-numeric:tabular-nums}
+.srow button{padding:2px 6px;font-size:12px;margin-left:auto}
+.srow button.edit{margin-left:0}
+
+.steprow{border-bottom:1px solid var(--border);padding:8px 12px;font-size:13px}
+.step-head{display:flex;align-items:center;gap:7px}
+.step-name{font-weight:600}
+.step-status{margin-left:6px;color:var(--dim);font-size:12px}
+.step-actions{margin-left:auto;display:flex;gap:4px}
+.step-actions button{padding:1px 6px;font-size:12px}
+.step-desc{color:var(--dim);font-size:12px;margin:3px 0 0 16px}
+.step-servers{margin:6px 0 0 16px;display:flex;flex-direction:column;gap:4px}
+.step-srv{display:flex;align-items:center;gap:6px;font-size:12px}
+.step-progress{flex:1;height:5px;background:var(--panel2);border-radius:3px;overflow:hidden;max-width:110px}
+.step-progress i{display:block;height:100%;background:var(--accent)}
+.step-srv.done .step-progress i{background:var(--good)}
+.step-srv.err .step-progress i{background:var(--danger)}
+.step-err{color:var(--danger);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:180px}
+.steprow.status-running .dot{background:var(--accent);animation:pulse 1.1s infinite}
+.steprow.status-done .dot{background:var(--good)}
+.steprow.status-failed .dot{background:var(--danger)}
+.steprow.status-skipped .dot{background:var(--warn)}
+.steprow.status-pending .dot{background:var(--border)}
+.steprow .dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+.steprow.next .step-name{color:var(--accent)}
+
+/* ---- console ---- */
+#console-panel{flex:1;display:flex;flex-direction:column;min-width:0}
+#console{
+  flex:1; overflow:auto; padding:8px 12px; background:var(--bg);
+  font-family:ui-monospace,Consolas,"Cascadia Mono",monospace;
+  font-size:var(--console-font-size);
+}
+.line{padding:1px 0;white-space:pre-wrap;word-break:break-word;display:flex;gap:8px;align-items:baseline}
+.line .ts{color:#4a5164;font-size:.85em;flex:0 0 auto}
+.line .tag{flex:0 0 auto}
+.line .txt{flex:1;min-width:0}
+.line.k-out .txt{color:var(--text)}
+.line.k-cmd .txt{color:var(--accent);font-weight:600}
+.line.k-err .txt{color:var(--danger);font-weight:600}
+.line.k-sys .txt,.line.k-info .txt{color:var(--dim);font-style:italic}
+.line.k-in .txt{color:var(--good);font-style:italic}
+.line .arrow{color:var(--good);flex:0 0 auto}
+.line.k-progress{align-items:center}
+.progress-wrap{width:140px;height:7px;background:var(--panel2);border-radius:4px;overflow:hidden;flex:0 0 auto}
+.progress-bar{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
+.progress-text{color:var(--dim);font-size:12px}
+
+#cmdform{border-top:1px solid var(--border);background:var(--panel);padding:8px 12px;flex:0 0 auto}
+#quickbar{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+#quickbar button{font-size:12px;padding:5px 10px}
+#quickbar button.go{border-color:var(--good);color:var(--good)}
+#quickbar button.warn{border-color:var(--warn);color:var(--warn)}
+#quickbar button.danger{border-color:var(--danger);color:var(--danger)}
+.cmdrow{display:flex;gap:8px}
+#cmdinput{flex:1;font-family:ui-monospace,Consolas,monospace}
+
+/* ---- editor ---- */
+.editor-path{display:flex;gap:8px;margin-bottom:10px}
+#editor-server{flex:0 0 160px}
+#editor-file{flex:1;font-family:ui-monospace,Consolas,monospace}
+#editor-text{
+  width:100%;height:48vh;resize:vertical;font-family:ui-monospace,Consolas,monospace;
+  font-size:13px;white-space:pre;
+}
+.editor-actions{display:flex;align-items:center;gap:8px;margin-top:10px}
+
+/* ---- help ---- */
+#help table{border-collapse:collapse;width:100%;font-size:13px}
+#help td{padding:4px 8px;border-bottom:1px solid var(--border);vertical-align:top}
+#help td:first-child{font-family:ui-monospace,Consolas,monospace;color:var(--accent);white-space:nowrap}
+</style>
+</head>
+<body>
+
+<header id="topbar">
+  <div class="brand">sshrun</div>
+  <span id="conn-dot" title="Соединение с программой"></span>
+  <div id="cfginfo"></div>
+  <div class="spacer"></div>
+  <button id="btn-help" title="Справка по командам">?</button>
+  <a id="btn-log" class="hidden" href="/api/log" target="_blank">⬇ лог</a>
+  <button id="btn-switch" class="hidden">Сменить конфиг</button>
+  <button id="btn-quit" class="danger">Выход</button>
+</header>
+
+<div id="picker" class="overlay">
+  <div class="box">
+    <h2>Выберите конфигурацию</h2>
+    <div id="picker-error" class="err-box hidden"></div>
+    <div id="picker-list"></div>
+    <div class="picker-manual">
+      <input id="picker-path" placeholder="или укажите путь к файлу конфигурации">
+      <button id="picker-open">Открыть</button>
+    </div>
+    <button id="picker-refresh">Обновить список</button>
+  </div>
+</div>
+
+<div id="main" class="hidden">
+  <aside id="sidebar">
+    <h3>Серверы</h3>
+    <div id="servers"></div>
+    <h3>Шаги</h3>
+    <div id="steps"></div>
+  </aside>
+  <section id="console-panel">
+    <div id="console"></div>
+    <form id="cmdform">
+      <div id="quickbar"></div>
+      <div class="cmdrow">
+        <input id="cmdinput" autocomplete="off" placeholder="Enter — продолжить; или «сервер команда», upload, edit, repeat N, goto N…">
+        <button type="submit">Отправить</button>
+      </div>
+    </form>
+  </section>
+</div>
+
+<div id="editor" class="overlay hidden">
+  <div class="box wide">
+    <h2>Редактирование файла на сервере</h2>
+    <div class="editor-path">
+      <select id="editor-server"></select>
+      <input id="editor-file" placeholder="/путь/к/файлу">
+      <button id="editor-load">Открыть</button>
+    </div>
+    <div id="editor-error" class="err-box hidden"></div>
+    <textarea id="editor-text" spellcheck="false" placeholder="Содержимое файла появится здесь"></textarea>
+    <div class="editor-actions">
+      <span id="editor-meta" class="dim"></span>
+      <span class="spacer"></span>
+      <button id="editor-cancel">Закрыть</button>
+      <button id="editor-save" class="primary">Сохранить на сервере</button>
+    </div>
+  </div>
+</div>
+
+<div id="help" class="overlay hidden">
+  <div class="box wide">
+    <h2>Команды</h2>
+    <table>
+      <tr><td>Enter</td><td>выполнить следующий шаг / продолжить после паузы</td></tr>
+      <tr><td>&lt;сервер&gt; &lt;команда&gt;</td><td>выполнить команду на сервере (сервер1,сервер2 — на нескольких)</td></tr>
+      <tr><td>all &lt;команда&gt;</td><td>выполнить на всех серверах</td></tr>
+      <tr><td>upload &lt;сервер|all&gt; &lt;локальный&gt; &lt;удалённый&gt;</td><td>загрузить файл или каталог</td></tr>
+      <tr><td>edit &lt;сервер&gt; &lt;файл&gt;</td><td>открыть файл во встроенном редакторе (или кнопка ✎ у сервера)</td></tr>
+      <tr><td>repeat [N]</td><td>повторить шаг N (по умолчанию — последний/упавший)</td></tr>
+      <tr><td>retry</td><td>после ошибки — продолжить шаг с места остановки</td></tr>
+      <tr><td>skip</td><td>после ошибки — игнорировать и идти дальше</td></tr>
+      <tr><td>goto N</td><td>перейти к шагу N и выполнить его</td></tr>
+      <tr><td>break &lt;сервер&gt;</td><td>Ctrl+C команде на сервере</td></tr>
+      <tr><td>status / servers</td><td>список серверов и их адресов</td></tr>
+      <tr><td>quit</td><td>завершить программу</td></tr>
+    </table>
+    <div class="editor-actions"><span class="spacer"></span><button id="help-close">Закрыть</button></div>
+  </div>
+</div>
+
+<div id="bye" class="overlay hidden">
+  <div class="box">
+    <h2>Программа завершена</h2>
+    <p class="dim">Все соединения с серверами закрыты. Это окно можно закрыть.</p>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ---------- утилиты ----------
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function escapeRegExp(s){ return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
+function safeStyleVal(s){ return String(s||'').replace(/[^#a-zA-Z0-9(),.%\s-]/g,''); }
+function truncate(s,n){ s=String(s); return s.length>n ? s.slice(0,n)+'…' : s; }
+function fmtDur(sec){
+  const m=Math.floor(sec/60), s=sec%60;
+  return m>0 ? (m+'м '+s+'с') : (s+'с');
+}
+function fmtTime(ms){
+  const d=new Date(ms);
+  const p=n=>String(n).padStart(2,'0');
+  return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+}
+async function api(path, body){
+  const res = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})});
+  let data = null;
+  try { data = await res.json(); } catch(e) {}
+  if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
+  return data;
+}
+
+// ---------- глобальное состояние ----------
+let G = {loaded:false, configs:[], app:null, ui:null};
+let UI = {font_size:13, max_lines:20000, timestamps:true};
+let compiledRules = [];
+const openLine = new Map();      // server -> {el, txtEl} — незакрытая строка вывода
+const progressRows = new Map();  // server -> div — текущая полоска загрузки
+let stickToBottom = true;
+
+// ---------- элементы ----------
+const el = id => document.getElementById(id);
+const pickerEl=el('picker'), pickerListEl=el('picker-list'), pickerErrorEl=el('picker-error'),
+      pickerPathEl=el('picker-path');
+const mainEl=el('main'), serversEl=el('servers'), stepsEl=el('steps'), consoleEl=el('console'),
+      quickbarEl=el('quickbar'), cmdinputEl=el('cmdinput'), cmdformEl=el('cmdform');
+const cfginfoEl=el('cfginfo'), connDotEl=el('conn-dot'), btnLogEl=el('btn-log'),
+      btnSwitchEl=el('btn-switch'), btnQuitEl=el('btn-quit'), btnHelpEl=el('btn-help');
+const editorEl=el('editor'), editorServerSel=el('editor-server'), editorFileInput=el('editor-file'),
+      editorTextEl=el('editor-text'), editorErrorEl=el('editor-error'), editorMetaEl=el('editor-meta');
+const helpEl=el('help');
+const byeEl=el('bye');
+
+// ---------- подсветка ----------
+function compileRules(rules){
+  return (rules||[]).map(r=>{
+    const src = r.regex ? r.pattern : escapeRegExp(r.pattern);
+    const flags = 'g' + (r.ignore_case === false ? '' : 'i');
+    let re;
+    try { re = new RegExp(src, flags); } catch(e){ return null; }
+    return Object.assign({}, r, {re});
+  }).filter(Boolean);
+}
+function rulesFor(kind){
+  return compiledRules.filter(r => !r.kinds || !r.kinds.length || r.kinds.includes(kind));
+}
+function ruleStyle(r){
+  let s='';
+  if(r.color) s+='color:'+safeStyleVal(r.color)+';';
+  if(r.background) s+='background:'+safeStyleVal(r.background)+';';
+  if(r.bold) s+='font-weight:700;';
+  if(r.italic) s+='font-style:italic;';
+  if(r.underline) s+='text-decoration:underline;';
+  return s;
+}
+function markMatches(text, rules){
+  const marks=[];
+  for(const r of rules){
+    r.re.lastIndex=0;
+    let m, guard=0;
+    while((m=r.re.exec(text)) && guard++<2000){
+      const start=m.index, len=m[0].length;
+      if(len===0){ r.re.lastIndex++; continue; }
+      const end=start+len;
+      if(!marks.some(mk => start<mk.end && end>mk.start)) marks.push({start,end,rule:r});
+      if(!r.re.global) break;
+    }
+  }
+  if(!marks.length) return esc(text);
+  marks.sort((a,b)=>a.start-b.start);
+  let html='', pos=0;
+  for(const mk of marks){
+    if(mk.start<pos) continue;
+    html += esc(text.slice(pos, mk.start));
+    html += '<span style="'+ruleStyle(mk.rule)+'">'+esc(text.slice(mk.start, mk.end))+'</span>';
+    pos = mk.end;
+  }
+  html += esc(text.slice(pos));
+  return html;
+}
+function highlightText(text, kind){
+  const rules = rulesFor(kind);
+  for(const r of rules){
+    if(r.scope==='line'){
+      r.re.lastIndex=0;
+      if(r.re.test(text)) return '<span style="'+ruleStyle(r)+'">'+esc(text)+'</span>';
+    }
+  }
+  return markMatches(text, rules.filter(r=>r.scope!=='line'));
+}
+
+// ---------- цвет сервера ----------
+function hashColor(name){
+  let h=0; for(let i=0;i<name.length;i++) h=(h*31+name.charCodeAt(i))>>>0;
+  return 'hsl('+(h%360)+' 65% 45%)';
+}
+function serverColor(name){
+  const s = (G.app && G.app.servers || []).find(s=>s.name===name);
+  return (s && s.color) ? s.color : hashColor(name);
+}
+function tagStyle(name){ return 'background:'+safeStyleVal(serverColor(name))+';'; }
+
+// ---------- консоль ----------
+function resetConsole(){
+  consoleEl.innerHTML='';
+  openLine.clear();
+  progressRows.clear();
+  const note=document.createElement('div');
+  note.className='line k-sys';
+  note.innerHTML='<span class="txt dim">— новая сессия —</span>';
+  consoleEl.appendChild(note);
+}
+function trimConsole(){
+  const max=(UI && UI.max_lines) || 20000;
+  while(consoleEl.children.length>max) consoleEl.removeChild(consoleEl.firstChild);
+}
+function scrollMaybe(){ if(stickToBottom) consoleEl.scrollTop=consoleEl.scrollHeight; }
+consoleEl.addEventListener('scroll', ()=>{
+  stickToBottom = consoleEl.scrollHeight - consoleEl.scrollTop - consoleEl.clientHeight < 40;
+});
+
+function lineHead(ev){
+  let html='';
+  if(UI.timestamps) html += '<span class="ts">'+fmtTime(ev.t)+'</span>';
+  if(ev.server) html += '<span class="tag" style="'+tagStyle(ev.server)+'">'+esc(ev.server)+'</span>';
+  if(ev.kind==='in') html += '<span class="arrow">›</span>';
+  return html;
+}
+
+function appendEvent(ev){
+  if(ev.kind==='progress'){ showProgress(ev); return; }
+  if(progressRows.has(ev.server)) removeProgress(ev.server);
+
+  if(ev.kind==='out' && ev.server){
+    const ol = openLine.get(ev.server);
+    if(ol){
+      ol.txtEl.insertAdjacentHTML('beforeend', highlightText(ev.text, ev.kind));
+      if(!ev.partial) openLine.delete(ev.server);
+      trimConsole(); scrollMaybe();
+      return;
+    }
+  }
+  const div=document.createElement('div');
+  div.className='line k-'+ev.kind;
+  div.innerHTML = lineHead(ev) + '<span class="txt">'+highlightText(ev.text, ev.kind)+'</span>';
+  consoleEl.appendChild(div);
+  if(ev.kind==='out' && ev.server && ev.partial){
+    openLine.set(ev.server, {el:div, txtEl:div.querySelector('.txt')});
+  }
+  trimConsole(); scrollMaybe();
+}
+
+function showProgress(ev){
+  let row=progressRows.get(ev.server);
+  if(!row){
+    row=document.createElement('div');
+    row.className='line k-progress';
+    row.innerHTML = '<span class="tag" style="'+tagStyle(ev.server)+'">'+esc(ev.server)+'</span>'
+      + '<span class="progress-wrap"><i class="progress-bar"></i></span>'
+      + '<span class="progress-text"></span>';
+    consoleEl.appendChild(row);
+    progressRows.set(ev.server, row);
+  }
+  row.querySelector('.progress-bar').style.width = Math.max(2, ev.pct||0)+'%';
+  row.querySelector('.progress-text').textContent = ev.text;
+  trimConsole(); scrollMaybe();
+}
+function removeProgress(server){
+  const row=progressRows.get(server);
+  if(row){ row.remove(); progressRows.delete(server); }
+}
+
+// ---------- боковая панель: серверы ----------
+function stateLabel(s){
+  return {disconnected:'не подключён', connecting:'подключение…', idle:'готов', busy:'выполняет'}[s] || s;
+}
+function renderServers(servers){
+  serversEl.innerHTML='';
+  for(const s of servers){
+    const row=document.createElement('div');
+    row.className='srow st-'+s.state;
+    let extra='';
+    if(s.state==='busy'){
+      extra = '<div class="srow-cmd" title="'+esc(s.cmd||'')+'">'+esc(truncate(s.cmd||'',48))+'</div>'
+        + '<span class="srow-time" data-since="'+(s.busy_since||0)+'"></span>'
+        + '<button class="brk" data-server="'+esc(s.name)+'" title="Прервать (Ctrl+C)">⏹</button>';
+    }
+    row.innerHTML =
+      '<span class="dot"></span>'+
+      '<span class="tag" style="'+tagStyle(s.name)+'">'+esc(s.name)+'</span>'+
+      '<span class="addr">'+esc(s.user)+'@'+esc(s.host)+':'+s.port+'</span>'+
+      '<span class="stlabel">'+stateLabel(s.state)+'</span>'+
+      extra+
+      '<button class="edit" data-server="'+esc(s.name)+'" title="Редактировать файл">✎</button>';
+    serversEl.appendChild(row);
+  }
+}
+serversEl.addEventListener('click', e=>{
+  const brk=e.target.closest('.brk');
+  if(brk){ sendCmd('break '+brk.dataset.server); return; }
+  const ed=e.target.closest('.edit');
+  if(ed){ openEditor(ed.dataset.server, ''); }
+});
+setInterval(()=>{
+  document.querySelectorAll('.srow-time[data-since]').forEach(elx=>{
+    const since=Number(elx.dataset.since);
+    if(!since) return;
+    elx.textContent = fmtDur(Math.max(0, Math.floor((Date.now()-since)/1000)));
+  });
+}, 1000);
+
+// ---------- боковая панель: шаги ----------
+function statusLabel(s){
+  return {pending:'ожидает', running:'выполняется', done:'готово', failed:'ошибка', skipped:'пропущен'}[s] || s;
+}
+function renderSteps(app){
+  stepsEl.innerHTML='';
+  app.steps.forEach((st,i)=>{
+    const row=document.createElement('div');
+    row.className='steprow status-'+st.status+(i===app.cur && st.status==='pending' ? ' next':'');
+    let subrows='';
+    if(st.servers && st.servers.length){
+      subrows = '<div class="step-servers">' + st.servers.map(ss=>{
+        const pct = ss.total ? Math.round(ss.done/ss.total*100) : 0;
+        const cls = ss.err ? 'err' : (ss.total>0 && ss.done>=ss.total ? 'done' : '');
+        return '<div class="step-srv '+cls+'">'
+          + '<span class="tag mini" style="'+tagStyle(ss.server)+'">'+esc(ss.server)+'</span>'
+          + '<span class="step-progress"><i style="width:'+pct+'%"></i></span>'
+          + (ss.err ? '<span class="step-err" title="'+esc(ss.err)+'">'+esc(truncate(ss.err,60))+'</span>' : '')
+          + '</div>';
+      }).join('') + '</div>';
+    }
+    row.innerHTML =
+      '<div class="step-head">'+
+        '<span class="dot"></span>'+
+        '<span class="step-name">'+(i+1)+'. '+esc(st.name)+'</span>'+
+        '<span class="step-status">'+statusLabel(st.status)+'</span>'+
+        '<span class="step-actions">'+
+          '<button class="goto" data-idx="'+i+'" title="Перейти к шагу и выполнить">▶</button>'+
+          '<button class="repeat" data-idx="'+i+'" title="Повторить шаг">⟳</button>'+
+        '</span>'+
+      '</div>'+
+      (st.description ? '<div class="step-desc">'+esc(st.description)+'</div>' : '')+
+      subrows;
+    stepsEl.appendChild(row);
+  });
+}
+stepsEl.addEventListener('click', e=>{
+  const g=e.target.closest('button.goto');
+  const r=e.target.closest('button.repeat');
+  if(g) sendCmd('goto '+(Number(g.dataset.idx)+1));
+  if(r) sendCmd('repeat '+(Number(r.dataset.idx)+1));
+});
+
+// ---------- панель команд ----------
+function renderQuickbar(app){
+  const buttons=[];
+  if(app.mode==='blocked'){
+    buttons.push(['retry','▶ Продолжить (retry)','go'], ['skip','Пропустить ошибку','danger']);
+  } else if(app.mode==='prompt' || app.mode==='end'){
+    buttons.push(['','▶ Продолжить','go']);
+  }
+  quickbarEl.innerHTML = buttons.map(([cmd,label,cls])=>
+    '<button data-cmd="'+esc(cmd)+'" class="'+(cls||'')+'">'+esc(label)+'</button>'
+  ).join('');
+}
+quickbarEl.addEventListener('click', e=>{
+  const btn=e.target.closest('button[data-cmd]');
+  if(btn) sendCmd(btn.dataset.cmd);
+});
+cmdformEl.addEventListener('submit', e=>{
+  e.preventDefault();
+  const text=cmdinputEl.value;
+  cmdinputEl.value='';
+  sendCmd(text);
+});
+async function sendCmd(text){
+  try{ await api('/api/cmd', {text}); }
+  catch(e){
+    const div=document.createElement('div');
+    div.className='line k-err';
+    div.innerHTML='<span class="txt">Не удалось отправить: '+esc(e.message)+'</span>';
+    consoleEl.appendChild(div); trimConsole(); scrollMaybe();
+  }
+  cmdinputEl.focus();
+}
+
+// ---------- редактор ----------
+function syncEditorServers(servers){
+  const cur=editorServerSel.value;
+  editorServerSel.innerHTML = servers.map(s=>'<option value="'+esc(s.name)+'">'+esc(s.name)+'</option>').join('');
+  if(cur) editorServerSel.value=cur;
+}
+function showEditorError(msg){
+  editorErrorEl.textContent=msg;
+  editorErrorEl.classList.remove('hidden');
+}
+let editorState={server:null, path:null, crlf:false};
+function openEditor(server, path){
+  editorEl.classList.remove('hidden');
+  editorErrorEl.classList.add('hidden');
+  if(server) editorServerSel.value=server;
+  editorFileInput.value = path||'';
+  editorState = {server:null, path:null, crlf:false};
+  if(server && path){ loadEditorFile(server, path); }
+  else { editorTextEl.value=''; editorMetaEl.textContent=''; editorFileInput.focus(); }
+}
+async function loadEditorFile(server, path){
+  editorErrorEl.classList.add('hidden');
+  editorTextEl.value='Загрузка…';
+  editorTextEl.disabled=true;
+  try{
+    const f=await api('/api/file/read', {server, path});
+    editorState={server, path, crlf:!!f.crlf};
+    editorTextEl.value=f.content||'';
+    editorMetaEl.textContent = f.is_new ? 'новый файл' : (f.size+' байт'+(f.crlf?', CRLF':''));
+  }catch(e){
+    editorTextEl.value='';
+    showEditorError(e.message);
+  }finally{
+    editorTextEl.disabled=false;
+  }
+}
+el('editor-load').onclick=()=>{
+  const server=editorServerSel.value, path=editorFileInput.value.trim();
+  if(!server||!path) return;
+  loadEditorFile(server, path);
+};
+el('editor-save').onclick=async()=>{
+  if(!editorState.server||!editorState.path){ showEditorError('Сначала откройте файл.'); return; }
+  try{
+    await api('/api/file/write', {server:editorState.server, path:editorState.path, content:editorTextEl.value, crlf:editorState.crlf});
+    editorEl.classList.add('hidden');
+  }catch(e){ showEditorError(e.message); }
+};
+el('editor-cancel').onclick=()=>editorEl.classList.add('hidden');
+
+// ---------- справка ----------
+btnHelpEl.onclick=()=>helpEl.classList.remove('hidden');
+el('help-close').onclick=()=>helpEl.classList.add('hidden');
+
+// ---------- шапка / переключение конфига ----------
+function renderHeader(g){
+  cfginfoEl.textContent = g.name + ' · лог: ' + g.log;
+  btnLogEl.classList.remove('hidden');
+  btnSwitchEl.classList.remove('hidden');
+}
+btnSwitchEl.onclick=async()=>{
+  if(!confirm('Сменить конфигурацию? Текущие подключения к серверам будут закрыты, а выполняющиеся команды прерваны.')) return;
+  try{ await api('/api/unload', {}); }catch(e){ alert(e.message); }
+};
+btnQuitEl.onclick=async()=>{
+  if(!confirm('Завершить программу? Все соединения с серверами будут закрыты.')) return;
+  try{ await api('/api/quit', {}); }catch(e){}
+};
+
+// ---------- выбор конфига ----------
+function renderPicker(g){
+  if(g.error){
+    pickerErrorEl.textContent=g.error;
+    pickerErrorEl.classList.remove('hidden');
+  } else {
+    pickerErrorEl.classList.add('hidden');
+  }
+  pickerListEl.innerHTML = (g.configs||[]).map(c=>
+    '<button class="cfg-item" data-path="'+esc(c.path)+'">'+
+      '<span class="cfg-name">'+esc(c.name)+'</span>'+
+      '<span class="cfg-dir">'+esc(c.dir)+'</span>'+
+    '</button>'
+  ).join('') || '<div class="dim">Рядом с программой файлы *config.json не найдены — укажите путь вручную.</div>';
+}
+pickerListEl.addEventListener('click', e=>{
+  const b=e.target.closest('.cfg-item');
+  if(b) loadConfig(b.dataset.path);
+});
+el('picker-open').onclick=()=>{
+  const p=pickerPathEl.value.trim();
+  if(p) loadConfig(p);
+};
+pickerPathEl.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); el('picker-open').click(); } });
+el('picker-refresh').onclick=async()=>{ try{ await api('/api/refresh', {}); }catch(e){} };
+async function loadConfig(path){
+  try{ await api('/api/load', {path}); }
+  catch(e){ pickerErrorEl.textContent=e.message; pickerErrorEl.classList.remove('hidden'); }
+}
+
+// ---------- состояние приложения ----------
+function updateGuiState(g){
+  G=g;
+  pickerEl.classList.toggle('hidden', !!g.loaded);
+  mainEl.classList.toggle('hidden', !g.loaded);
+  if(!g.loaded){
+    btnLogEl.classList.add('hidden');
+    btnSwitchEl.classList.add('hidden');
+    cfginfoEl.textContent='';
+    renderPicker(g);
+    return;
+  }
+  UI = g.ui || UI;
+  const enabled = UI.highlight && UI.highlight.enabled;
+  compiledRules = compileRules(enabled ? UI.highlight.rules : []);
+  document.documentElement.style.setProperty('--console-font-size', (UI.font_size||13)+'px');
+  renderHeader(g);
+  renderServers(g.app.servers);
+  renderSteps(g.app);
+  renderQuickbar(g.app);
+  syncEditorServers(g.app.servers);
+  if(document.activeElement===document.body) cmdinputEl.focus();
+}
+
+// ---------- поток событий ----------
+function connectSSE(){
+  const es=new EventSource('/api/events');
+  es.addEventListener('state', e=>updateGuiState(JSON.parse(e.data)));
+  es.addEventListener('reset', ()=>resetConsole());
+  es.addEventListener('ui', e=>{
+    const m=JSON.parse(e.data);
+    if(m.action==='edit') openEditor(m.server, m.path);
+  });
+  es.addEventListener('bye', ()=>{
+    byeEl.classList.remove('hidden');
+    es.close();
+  });
+  es.onmessage=e=>appendEvent(JSON.parse(e.data));
+  es.onopen=()=>connDotEl.classList.add('on');
+  es.onerror=()=>connDotEl.classList.remove('on');
+}
+
+(async function boot(){
+  try{
+    const st=await (await fetch('/api/state')).json();
+    updateGuiState(st);
+  }catch(e){}
+  connectSSE();
+  cmdinputEl.focus();
+})();
+</script>
+</body>
+</html>

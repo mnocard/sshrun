@@ -40,6 +40,20 @@ func (l *Logger) Close() { l.f.Close() }
 
 // ---------- консоль ----------
 
+// Event — одна запись потока вывода в структурном виде (для GUI).
+// Kind: out (вывод сервера), cmd (отправленная команда), sys (сообщение о сервере),
+// info (общее сообщение программы), err (ошибка), in (ввод пользователя),
+// progress (состояние загрузки большого файла — обновляется на месте).
+type Event struct {
+	Seq     int64  `json:"seq"`
+	T       int64  `json:"t"` // unix, миллисекунды
+	Server  string `json:"server,omitempty"`
+	Kind    string `json:"kind"`
+	Text    string `json:"text"`
+	Partial bool   `json:"partial,omitempty"` // строка ещё не закончена (например, «Password: »)
+	Pct     int    `json:"pct,omitempty"`
+}
+
 type lineState struct {
 	buf     []rune
 	cr      bool // на конце потока был \r
@@ -56,7 +70,8 @@ type Console struct {
 	log   *Logger
 	width int
 	st    map[string]*lineState
-	open  string // кто сейчас держит незавершённую строку на экране
+	open  string      // кто сейчас держит незавершённую строку на экране
+	sink  func(Event) // если задан — каждое событие дополнительно уходит сюда (GUI)
 }
 
 const promptOwner = "\x00prompt"
@@ -69,6 +84,22 @@ func NewConsole(w io.Writer, log *Logger, names []string) *Console {
 		}
 	}
 	return c
+}
+
+// SetSink подключает получателя структурных событий (вызывается до начала работы).
+func (c *Console) SetSink(f func(Event)) {
+	c.mu.Lock()
+	c.sink = f
+	c.mu.Unlock()
+}
+
+// sendEvent вызывается под c.mu; получатель не должен блокироваться.
+func (c *Console) sendEvent(ev Event) {
+	if c.sink == nil {
+		return
+	}
+	ev.T = time.Now().UnixMilli()
+	c.sink(ev)
 }
 
 func (c *Console) state(name string) *lineState {
@@ -153,6 +184,7 @@ func (c *Console) emit(name, text string, complete bool) {
 		st.midline = false
 		return
 	}
+	c.sendEvent(Event{Server: name, Kind: "out", Text: text, Partial: !complete})
 	c.breakLine(name)
 	if !st.midline {
 		fmt.Fprint(c.w, c.prefix(name))
@@ -179,6 +211,28 @@ func (c *Console) line(who, kind, text string, prefixed bool) {
 	}
 	fmt.Fprintln(c.w, text)
 	c.log.Write(who, kind, text)
+	ev := Event{Kind: strings.ToLower(kind), Text: text}
+	if prefixed {
+		ev.Server = who
+	} else if ev.Kind == "sys" {
+		ev.Kind = "info"
+	}
+	c.sendEvent(ev)
+}
+
+// Progress — состояние загрузки большого файла. В консоли это обычная строка,
+// в GUI — одна полоска, обновляемая на месте.
+func (c *Console) Progress(name, text string, pct int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.log.Write(name, "SYS", text)
+	if c.sink != nil {
+		c.sendEvent(Event{Server: name, Kind: "progress", Text: text, Pct: pct})
+		return
+	}
+	c.breakLine("")
+	fmt.Fprint(c.w, c.prefix(name))
+	fmt.Fprintln(c.w, text)
 }
 
 // Cmd — команда, отправляемая на сервер.
@@ -213,6 +267,7 @@ func (c *Console) UserLine(text string) {
 	defer c.mu.Unlock()
 	c.open = ""
 	c.log.Write("user", "IN", text)
+	c.sendEvent(Event{Kind: "in", Text: text})
 }
 
 // ---------- ANSI ----------
