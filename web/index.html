@@ -146,6 +146,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
 }
 .filter-chip:hover{border-color:var(--accent)}
 .filter-chip .sw{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+#quickbar button .sw{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:3px;vertical-align:middle}
 .filter-chip.active{color:var(--text);border-color:var(--accent);background:var(--panel2)}
 .filter-chip .cnt{color:var(--dim);font-variant-numeric:tabular-nums}
 #servers .tag{cursor:pointer}
@@ -602,9 +603,24 @@ function renderQuickbar(app){
   } else if(app.mode==='prompt' || app.mode==='end'){
     buttons.push(['','▶ Продолжить','go']);
   }
-  quickbarEl.innerHTML = buttons.map(([cmd,label,cls])=>
+  let html = buttons.map(([cmd,label,cls])=>
     '<button data-cmd="'+esc(cmd)+'" class="'+(cls||'')+'">'+esc(label)+'</button>'
   ).join('');
+
+  // Пока хоть один сервер занят — рядом с «Продолжить» (или вместо нужных кнопок,
+  // пока выполнение идёт и их нет) появляются кнопки остановки: по каждому занятому
+  // серверу отдельно и одна общая, даже если занят всего один — чтобы кнопка не
+  // «прыгала» по ходу выполнения шага, когда начинают занимать других.
+  const busy = (app.servers||[]).filter(s=>s.state==='busy');
+  if(busy.length){
+    html += busy.map(s=>
+      '<button data-cmd="break '+esc(s.name)+'" class="danger" title="Прервать команду на '+esc(s.name)+'">'+
+        '<span class="sw" style="background:'+safeStyleVal(serverColor(s.name))+'"></span>⏹ '+esc(s.name)+
+      '</button>'
+    ).join('');
+    html += '<button data-cmd="break all" class="danger" title="Прервать команды на всех занятых серверах">⏹ Остановить всё</button>';
+  }
+  quickbarEl.innerHTML = html;
 }
 quickbarEl.addEventListener('click', e=>{
   const btn=e.target.closest('button[data-cmd]');

@@ -336,6 +336,37 @@ func cutWord(s string) (first, rest string) {
 	return s, ""
 }
 
+// doBreak шлёт Ctrl+C всем живым подключениям из списка: одно имя сервера,
+// «сервер1,сервер2» или all/* — на все сразу. Общая реализация для команды
+// break (из строки ввода, в CLI и в GUI) и для кнопок «Остановить» в GUI.
+func (a *App) doBreak(tok string) {
+	tok = strings.TrimSpace(tok)
+	if tok == "" {
+		a.out.Info("Использование: break <сервер>|<сервер1,сервер2>|all")
+		return
+	}
+	targets := a.parseTargets(tok)
+	if targets == nil {
+		a.out.Info("Неизвестный сервер %q", tok)
+		return
+	}
+	var hit []string
+	for _, n := range targets {
+		if c := a.liveConn(n); c != nil {
+			c.Interrupt()
+			hit = append(hit, n)
+		}
+	}
+	switch len(hit) {
+	case 0:
+		a.out.Info("Нет активных подключений среди: %s", strings.Join(targets, ", "))
+	case 1:
+		a.out.Note(hit[0], "отправлен Ctrl+C")
+	default:
+		a.out.Info("Ctrl+C отправлен: %s", strings.Join(hit, ", "))
+	}
+}
+
 func (a *App) handleRunInput(text string) {
 	a.out.UserLine(text)
 	first, rest := cutWord(text)
@@ -344,12 +375,7 @@ func (a *App) handleRunInput(text string) {
 		a.out.Info("Выход по запросу пользователя")
 		a.exit(0)
 	case "break":
-		if c := a.liveConn(rest); c != nil {
-			c.Interrupt()
-			a.out.Note(rest, "отправлен Ctrl+C")
-		} else {
-			a.out.Info("Нет активного подключения к %q", rest)
-		}
+		a.doBreak(rest)
 		return
 	}
 	// «<сервер> <текст>» — ввод для команды на этом сервере.
@@ -374,7 +400,7 @@ func (a *App) handleRunInput(text string) {
 		a.out.Note(busy[0], "-> ввод передан выполняющейся команде")
 		return
 	}
-	a.out.Info("Идёт выполнение. Чтобы передать ввод команде, начните строку с имени сервера: «<сервер> <текст>»; «break <сервер>» — Ctrl+C.")
+	a.out.Info("Идёт выполнение. Чтобы передать ввод команде, начните строку с имени сервера: «<сервер> <текст>»; «break <сервер>|all» — Ctrl+C.")
 }
 
 func (a *App) liveConn(name string) *Conn {
@@ -645,11 +671,7 @@ func (a *App) dispatch(text string) bool {
 		a.notify()
 
 	case "break":
-		if c := a.liveConn(rest); c != nil {
-			c.Interrupt()
-		} else {
-			a.out.Info("Нет активного подключения к %q", rest)
-		}
+		a.doBreak(rest)
 
 	case "edit":
 		args := splitArgs(rest)
@@ -769,7 +791,7 @@ retry                            после ошибки: продолжить �
 skip                             после ошибки: игнорировать и идти дальше
 goto N                           перейти к шагу N и выполнить его
 steps | status | servers         список шагов | серверы: адрес и подключение
-break <сервер>                   Ctrl+C команде на сервере
+break <сервер>|сервер1,сервер2|all  Ctrl+C команде на сервере(ах)
 quit                             выход
 Пока команда выполняется, строка «<сервер> <текст>» отправляется ей на stdin
 (ответ на вопрос [y/N] и т.п.). Редактор: переменная SSHRUN_EDITOR / EDITOR.`), "\n") {
