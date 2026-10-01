@@ -135,6 +135,20 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
 
 /* ---- console ---- */
 #console-panel{flex:1;display:flex;flex-direction:column;min-width:0}
+#filterbar{
+  display:flex; flex-wrap:wrap; gap:6px; align-items:center;
+  padding:7px 12px; background:var(--panel); border-bottom:1px solid var(--border);
+}
+.filter-chip{
+  display:flex; align-items:center; gap:5px; padding:3px 10px 3px 8px;
+  border-radius:999px; border:1px solid var(--border); background:var(--panel2);
+  color:var(--dim); font-size:12px; cursor:pointer; user-select:none;
+}
+.filter-chip:hover{border-color:var(--accent)}
+.filter-chip .sw{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+.filter-chip.active{color:var(--text);border-color:var(--accent);background:var(--panel2)}
+.filter-chip .cnt{color:var(--dim);font-variant-numeric:tabular-nums}
+#servers .tag{cursor:pointer}
 #console{
   flex:1; overflow:auto; padding:8px 12px; background:var(--bg);
   font-family:ui-monospace,Consolas,"Cascadia Mono",monospace;
@@ -214,6 +228,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
     <div id="steps"></div>
   </aside>
   <section id="console-panel">
+    <div id="filterbar" class="hidden"></div>
     <div id="console"></div>
     <form id="cmdform">
       <div id="quickbar"></div>
@@ -306,13 +321,15 @@ let compiledRules = [];
 const openLine = new Map();      // server -> {el, txtEl} — незакрытая строка вывода
 const progressRows = new Map();  // server -> div — текущая полоска загрузки
 let stickToBottom = true;
+let consoleFilter = null;        // null — показывать все серверы; иначе имя сервера
 
 // ---------- элементы ----------
 const el = id => document.getElementById(id);
 const pickerEl=el('picker'), pickerListEl=el('picker-list'), pickerErrorEl=el('picker-error'),
       pickerPathEl=el('picker-path');
 const mainEl=el('main'), serversEl=el('servers'), stepsEl=el('steps'), consoleEl=el('console'),
-      quickbarEl=el('quickbar'), cmdinputEl=el('cmdinput'), cmdformEl=el('cmdform');
+      quickbarEl=el('quickbar'), cmdinputEl=el('cmdinput'), cmdformEl=el('cmdform'),
+      filterbarEl=el('filterbar');
 const cfginfoEl=el('cfginfo'), connDotEl=el('conn-dot'), btnLogEl=el('btn-log'),
       btnSwitchEl=el('btn-switch'), btnQuitEl=el('btn-quit'), btnHelpEl=el('btn-help');
 const editorEl=el('editor'), editorServerSel=el('editor-server'), editorFileInput=el('editor-file'),
@@ -394,11 +411,41 @@ function resetConsole(){
   consoleEl.innerHTML='';
   openLine.clear();
   progressRows.clear();
+  consoleFilter=null;
+  renderFilterBar();
   const note=document.createElement('div');
   note.className='line k-sys';
   note.innerHTML='<span class="txt dim">— новая сессия —</span>';
   consoleEl.appendChild(note);
 }
+
+// Строка без привязки к серверу (баннеры шагов и т.п.) видна при любом фильтре;
+// остальное — только когда выбрано «Все» или именно этот сервер.
+function lineVisible(server){ return !consoleFilter || !server || server===consoleFilter; }
+
+function setFilter(server){
+  consoleFilter = server || null;
+  renderFilterBar();
+  for(const el2 of consoleEl.children){
+    el2.style.display = lineVisible(el2.dataset.server) ? '' : 'none';
+  }
+  scrollMaybe();
+}
+
+function renderFilterBar(){
+  const servers = (G.app && G.app.servers) || [];
+  if(servers.length < 2){ filterbarEl.classList.add('hidden'); return; }
+  filterbarEl.classList.remove('hidden');
+  const chip = (name, label) =>
+    '<span class="filter-chip'+(consoleFilter===name ? ' active' : '')+'" data-filter="'+esc(name||'')+'">'+
+      (name ? '<span class="sw" style="background:'+safeStyleVal(serverColor(name))+'"></span>' : '') +
+      esc(label) + '</span>';
+  filterbarEl.innerHTML = chip(null, 'Все') + servers.map(s=>chip(s.name, s.name)).join('');
+}
+filterbarEl.addEventListener('click', e=>{
+  const c=e.target.closest('.filter-chip');
+  if(c) setFilter(c.dataset.filter || null);
+});
 function trimConsole(){
   const max=(UI && UI.max_lines) || 20000;
   while(consoleEl.children.length>max) consoleEl.removeChild(consoleEl.firstChild);
@@ -431,6 +478,8 @@ function appendEvent(ev){
   }
   const div=document.createElement('div');
   div.className='line k-'+ev.kind;
+  if(ev.server) div.dataset.server=ev.server;
+  if(!lineVisible(ev.server)) div.style.display='none';
   div.innerHTML = lineHead(ev) + '<span class="txt">'+highlightText(ev.text, ev.kind)+'</span>';
   consoleEl.appendChild(div);
   if(ev.kind==='out' && ev.server && ev.partial){
@@ -444,6 +493,8 @@ function showProgress(ev){
   if(!row){
     row=document.createElement('div');
     row.className='line k-progress';
+    row.dataset.server=ev.server;
+    if(!lineVisible(ev.server)) row.style.display='none';
     row.innerHTML = '<span class="tag" style="'+tagStyle(ev.server)+'">'+esc(ev.server)+'</span>'
       + '<span class="progress-wrap"><i class="progress-bar"></i></span>'
       + '<span class="progress-text"></span>';
@@ -476,7 +527,7 @@ function renderServers(servers){
     }
     row.innerHTML =
       '<span class="dot"></span>'+
-      '<span class="tag" style="'+tagStyle(s.name)+'">'+esc(s.name)+'</span>'+
+      '<span class="tag" data-server="'+esc(s.name)+'" style="'+tagStyle(s.name)+'">'+esc(s.name)+'</span>'+
       '<span class="addr">'+esc(s.user)+'@'+esc(s.host)+':'+s.port+'</span>'+
       '<span class="stlabel">'+stateLabel(s.state)+'</span>'+
       extra+
@@ -488,7 +539,9 @@ serversEl.addEventListener('click', e=>{
   const brk=e.target.closest('.brk');
   if(brk){ sendCmd('break '+brk.dataset.server); return; }
   const ed=e.target.closest('.edit');
-  if(ed){ openEditor(ed.dataset.server, ''); }
+  if(ed){ openEditor(ed.dataset.server, ''); return; }
+  const tag=e.target.closest('.tag');
+  if(tag){ setFilter(tag.dataset.server); }
 });
 setInterval(()=>{
   document.querySelectorAll('.srow-time[data-since]').forEach(elx=>{
@@ -691,6 +744,7 @@ function updateGuiState(g){
   document.documentElement.style.setProperty('--console-font-size', (UI.font_size||13)+'px');
   renderHeader(g);
   renderServers(g.app.servers);
+  renderFilterBar();
   renderSteps(g.app);
   renderQuickbar(g.app);
   syncEditorServers(g.app.servers);
