@@ -164,6 +164,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
 .line.k-cmd .txt{color:var(--accent);font-weight:600}
 .line.k-err .txt{color:var(--danger);font-weight:600}
 .line.k-sys .txt,.line.k-info .txt{color:var(--dim);font-style:italic}
+.line.k-warn .txt{color:var(--warn);font-weight:600}
 .line.k-in .txt{color:var(--good);font-style:italic}
 .line .arrow{color:var(--good);flex:0 0 auto}
 .line.k-progress{align-items:center}
@@ -203,10 +204,10 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
   <span id="conn-dot" title="Соединение с программой"></span>
   <div id="cfginfo"></div>
   <div class="spacer"></div>
-  <button id="btn-help" title="Справка по командам">?</button>
+  <button type="button" id="btn-help" title="Справка по командам">?</button>
   <a id="btn-log" class="hidden" href="/api/log" target="_blank">⬇ лог</a>
-  <button id="btn-switch" class="hidden">Сменить конфиг</button>
-  <button id="btn-quit" class="danger">Выход</button>
+  <button type="button" id="btn-switch" class="hidden">Сменить конфиг</button>
+  <button type="button" id="btn-quit" class="danger">Выход</button>
 </header>
 
 <div id="picker" class="overlay">
@@ -216,9 +217,9 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
     <div id="picker-list"></div>
     <div class="picker-manual">
       <input id="picker-path" placeholder="или укажите путь к файлу конфигурации">
-      <button id="picker-open">Открыть</button>
+      <button type="button" id="picker-open">Открыть</button>
     </div>
-    <button id="picker-refresh">Обновить список</button>
+    <button type="button" id="picker-refresh">Обновить список</button>
   </div>
 </div>
 
@@ -248,15 +249,15 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
     <div class="editor-path">
       <select id="editor-server"></select>
       <input id="editor-file" placeholder="/путь/к/файлу">
-      <button id="editor-load">Открыть</button>
+      <button type="button" id="editor-load">Открыть</button>
     </div>
     <div id="editor-error" class="err-box hidden"></div>
     <textarea id="editor-text" spellcheck="false" placeholder="Содержимое файла появится здесь"></textarea>
     <div class="editor-actions">
       <span id="editor-meta" class="dim"></span>
       <span class="spacer"></span>
-      <button id="editor-cancel">Закрыть</button>
-      <button id="editor-save" class="primary">Сохранить на сервере</button>
+      <button type="button" id="editor-cancel">Закрыть</button>
+      <button type="button" id="editor-save" class="primary">Сохранить на сервере</button>
     </div>
   </div>
 </div>
@@ -278,7 +279,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
       <tr><td>status / servers</td><td>список серверов и их адресов</td></tr>
       <tr><td>quit</td><td>завершить программу</td></tr>
     </table>
-    <div class="editor-actions"><span class="spacer"></span><button id="help-close">Закрыть</button></div>
+    <div class="editor-actions"><span class="spacer"></span><button type="button" id="help-close">Закрыть</button></div>
   </div>
 </div>
 
@@ -525,7 +526,7 @@ function renderServers(servers){
     if(s.state==='busy'){
       extra = '<div class="srow-cmd" title="'+esc(s.cmd||'')+'">'+esc(truncate(s.cmd||'',48))+'</div>'
         + '<span class="srow-time" data-since="'+(s.busy_since||0)+'"></span>'
-        + '<button class="brk" data-server="'+esc(s.name)+'" title="Прервать (Ctrl+C)">⏹</button>';
+        + '<button type="button" class="brk" data-server="'+esc(s.name)+'" title="Прервать (Ctrl+C)">⏹</button>';
     }
     row.innerHTML =
       '<span class="dot"></span>'+
@@ -533,7 +534,7 @@ function renderServers(servers){
       '<span class="addr">'+esc(s.user)+'@'+esc(s.host)+':'+s.port+'</span>'+
       '<span class="stlabel">'+stateLabel(s.state)+'</span>'+
       extra+
-      '<button class="edit" data-server="'+esc(s.name)+'" title="Редактировать файл">✎</button>';
+      '<button type="button" class="edit" data-server="'+esc(s.name)+'" title="Редактировать файл">✎</button>';
     serversEl.appendChild(row);
   }
 }
@@ -580,8 +581,8 @@ function renderSteps(app){
         '<span class="step-name">'+(i+1)+'. '+esc(st.name)+'</span>'+
         '<span class="step-status">'+statusLabel(st.status)+'</span>'+
         '<span class="step-actions">'+
-          '<button class="goto" data-idx="'+i+'" title="Перейти к шагу и выполнить">▶</button>'+
-          '<button class="repeat" data-idx="'+i+'" title="Повторить шаг">⟳</button>'+
+          '<button type="button" class="goto" data-idx="'+i+'" title="Перейти к шагу и выполнить">▶</button>'+
+          '<button type="button" class="repeat" data-idx="'+i+'" title="Повторить шаг">⟳</button>'+
         '</span>'+
       '</div>'+
       (st.description ? '<div class="step-desc">'+esc(st.description)+'</div>' : '')+
@@ -605,9 +606,9 @@ function renderQuickbar(app){
   const busy = (app.servers||[]).filter(s=>s.state==='busy');
   let html = '';
   if(busy.length){
-    html += '<button data-cmd="break all" class="danger" title="Прервать команды на всех занятых серверах">⏹ Остановить всё</button>';
+    html += '<button type="button" data-cmd="break all" class="danger" title="Прервать команды на всех занятых серверах">⏹ Остановить всё</button>';
     html += busy.map(s=>
-      '<button data-cmd="break '+esc(s.name)+'" class="danger" title="Прервать команду на '+esc(s.name)+'">'+
+      '<button type="button" data-cmd="break '+esc(s.name)+'" class="danger" title="Прервать команду на '+esc(s.name)+'">'+
         '⏹ '+esc(s.name)+' <span class="sw sw-busy"></span>'+
       '</button>'
     ).join('');
@@ -620,7 +621,7 @@ function renderQuickbar(app){
     buttons.push(['','▶ Продолжить','go']);
   }
   html += buttons.map(([cmd,label,cls])=>
-    '<button data-cmd="'+esc(cmd)+'" class="'+(cls||'')+'">'+esc(label)+'</button>'
+    '<button type="button" data-cmd="'+esc(cmd)+'" class="'+(cls||'')+'">'+esc(label)+'</button>'
   ).join('');
   quickbarEl.innerHTML = html;
 }
@@ -723,7 +724,7 @@ function renderPicker(g){
     pickerErrorEl.classList.add('hidden');
   }
   pickerListEl.innerHTML = (g.configs||[]).map(c=>
-    '<button class="cfg-item" data-path="'+esc(c.path)+'">'+
+    '<button type="button" class="cfg-item" data-path="'+esc(c.path)+'">'+
       '<span class="cfg-name">'+esc(c.name)+'</span>'+
       '<span class="cfg-dir">'+esc(c.dir)+'</span>'+
     '</button>'

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"io/fs"
@@ -39,23 +40,31 @@ func (r reporter) Progress(text string, pct int) {
 // а сам файл и так загрузится за секунды.
 const progressThreshold = 8 * 1024 * 1024
 
-// countingReader считает прочитанные байты атомарно, не блокируя чтение.
-// Поле f — НЕ встроено (не анонимное): begin Go 1.22 у *os.File появился метод
-// WriteTo, и если бы мы встроили *os.File, countingReader promoted-бы его —
-// тогда io.Copy(dst, countingReader) выбрал бы src.WriteTo(dst) в обход нашего
-// Read (WriteTo не вызывает Read), и счётчик оставался бы нулевым при работающей
-// передаче. Явно реализуем только Read (со счётчиком) и Stat (чтобы sftp.File.
+// xferReader читает локальный файл для одной SFTP-передачи: считает прочитанные
+// байты атомарно (для прогресса) и проверяет контекст перед каждым чтением —
+// это и есть вся реализация отмены: как только ctx отменён, Read начинает
+// возвращать ошибку, io.Copy прерывается, Upload возвращает context.Canceled.
+// Проверка — поверх уже читаемых данных, поэтому на скорость передачи, пока
+// не отменено, не влияет.
+//
+// Поле f — НЕ встроено (не анонимное): начиная с Go 1.22 у *os.File появился
+// метод WriteTo, и если бы мы встроили *os.File, xferReader promoted-бы его —
+// тогда io.Copy(dst, xferReader) выбрал бы src.WriteTo(dst) в обход нашего Read
+// (WriteTo не вызывает Read), и ни счётчик, ни отмена не работали бы при
+// работающей передаче. Явно реализуем только Read и Stat (чтобы sftp.File.
 // ReadFrom по-прежнему узнавал размер файла и включал быстрый конкурентный
 // путь записи — см. github.com/pkg/sftp, ReadFrom: switch по
-// interface{ Stat() (os.FileInfo, error) }). Сам подсчёт — только
-// atomic.AddInt64 поверх уже читаемых данных, поэтому на скорость передачи
-// не влияет.
-type countingReader struct {
-	f *os.File
-	n int64
+// interface{ Stat() (os.FileInfo, error) }).
+type xferReader struct {
+	f   *os.File
+	ctx context.Context
+	n   int64
 }
 
-func (r *countingReader) Read(p []byte) (int, error) {
+func (r *xferReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
 	n, err := r.f.Read(p)
 	if n > 0 {
 		atomic.AddInt64(&r.n, int64(n))
@@ -63,11 +72,11 @@ func (r *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (r *countingReader) Stat() (os.FileInfo, error) { return r.f.Stat() }
+func (r *xferReader) Stat() (os.FileInfo, error) { return r.f.Stat() }
 
 // progressTicker раз в 2 секунды печатает процент, объём и текущую скорость.
 // Работает в отдельной горутине и не влияет на скорость самой передачи.
-func progressTicker(cr *countingReader, total int64, label string, report reporter, stop <-chan struct{}) {
+func progressTicker(cr *xferReader, total int64, label string, report reporter, stop <-chan struct{}) {
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
 	last, lastAt := int64(0), time.Now()
@@ -115,7 +124,10 @@ func resolveDest(sc *sftp.Client, local, remote string) string {
 	return remote
 }
 
-func copyFile(sc *sftp.Client, local, remote string, report reporter) (int64, error) {
+func copyFile(ctx context.Context, sc *sftp.Client, local, remote string, report reporter) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	src, err := os.Open(local)
 	if err != nil {
 		return 0, err
@@ -127,16 +139,14 @@ func copyFile(sc *sftp.Client, local, remote string, report reporter) (int64, er
 		return 0, fmt.Errorf("%s: %w", remote, err)
 	}
 
-	var reader io.Reader = src
+	xr := &xferReader{f: src, ctx: ctx}
 	if fi, statErr := src.Stat(); statErr == nil && report.progress != nil && fi.Size() >= progressThreshold {
-		cr := &countingReader{f: src}
-		reader = cr
 		stop := make(chan struct{})
-		go progressTicker(cr, fi.Size(), remote, report, stop)
+		go progressTicker(xr, fi.Size(), remote, report, stop)
 		defer close(stop)
 	}
 
-	n, err := io.Copy(dst, reader)
+	n, err := io.Copy(dst, xr)
 	if cerr := dst.Close(); err == nil {
 		err = cerr
 	}
@@ -146,13 +156,13 @@ func copyFile(sc *sftp.Client, local, remote string, report reporter) (int64, er
 	return n, err
 }
 
-func copyTree(sc *sftp.Client, local, remote string, report reporter) error {
+func copyTree(ctx context.Context, sc *sftp.Client, local, remote string, report reporter) error {
 	fi, err := os.Stat(local)
 	if err != nil {
 		return err
 	}
 	if !fi.IsDir() {
-		n, err := copyFile(sc, local, remote, report)
+		n, err := copyFile(ctx, sc, local, remote, report)
 		if err == nil {
 			report.Note(fmt.Sprintf("↑ %s (%s)", remote, humanSize(n)))
 		}
@@ -175,6 +185,11 @@ func copyTree(sc *sftp.Client, local, remote string, report reporter) error {
 		if err != nil {
 			return err
 		}
+		// Проверяем отмену между файлами — так остановка не ждёт файла, который
+		// как раз передаётся, и не начинает следующий после отмены.
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
 		rel, _ := filepath.Rel(local, p)
 		if rel == "." {
 			return nil
@@ -186,7 +201,7 @@ func copyTree(sc *sftp.Client, local, remote string, report reporter) error {
 				return fmt.Errorf("%s: %w", rp, err)
 			}
 		case d.Type().IsRegular():
-			n, err := copyFile(sc, p, rp, report)
+			n, err := copyFile(ctx, sc, p, rp, report)
 			if err != nil {
 				return err
 			}
@@ -207,19 +222,31 @@ func copyTree(sc *sftp.Client, local, remote string, report reporter) error {
 }
 
 // Upload загружает файл или каталог. При нехватке прав и default_sudo — через
-// временный каталог в /tmp и «sudo cp».
+// временный каталог в /tmp и «sudo cp». Можно прервать в любой момент —
+// Interrupt() (кнопка «Остановить»/команда break) отменяет контекст, которым
+// помечена вся загрузка; Upload в этом случае вернёт понятную ошибку, а не
+// «зависнет» до конца файла и не продолжит молча после отмены.
 func (c *Conn) Upload(local, remote string, report reporter) error {
 	if _, err := os.Stat(local); err != nil {
 		return err
 	}
+	ctx, done := c.startUpload(oneLine(local + " -> " + remote))
+	defer done()
+
 	remote = c.expand(remote)
 	sc, err := c.sftpc()
 	if err != nil {
 		return err
 	}
 	dst := resolveDest(sc, local, remote)
-	err = copyTree(sc, local, dst, report)
-	if err == nil || !(c.sudo && isPerm(err)) {
+	err = copyTree(ctx, sc, local, dst, report)
+	if err == nil {
+		return nil
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("загрузка отменена пользователем")
+	}
+	if !(c.sudo && isPerm(err)) {
 		return err
 	}
 
@@ -231,7 +258,10 @@ func (c *Conn) Upload(local, remote string, report reporter) error {
 	}
 	defer sc.RemoveAll(stage)
 	item := stage + "/" + filepath.Base(filepath.Clean(local))
-	if err := copyTree(sc, local, item, report); err != nil {
+	if err := copyTree(ctx, sc, local, item, report); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return fmt.Errorf("загрузка отменена пользователем")
+		}
 		return err
 	}
 	var script string

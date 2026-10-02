@@ -142,11 +142,22 @@ type App struct {
 	closed       atomic.Bool
 	shutOnce     sync.Once
 
+	// expectedClose — GUI выставляет перед намеренным закрытием канала ввода
+	// (пользователь нажал «Сменить конфиг»), чтобы отличить это от настоящей
+	// потери входного потока (например, закрыли консольное окно программы) —
+	// раньше оба случая писали в лог одну и ту же фразу, и по логу нельзя
+	// было понять, что произошло на самом деле.
+	expectedClose atomic.Bool
+
 	// Хуки для GUI (в консольном режиме nil).
 	OnState    func()                    // состояние изменилось
 	OnExit     func()                    // программа сейчас завершится
 	OpenEditor func(server, path string) // открыть встроенный редактор вместо внешнего
 }
+
+// ExpectInputClose — вызывается перед намеренным закрытием канала ввода (смена
+// конфига в GUI), чтобы promptLoop не принял это за потерю связи.
+func (a *App) ExpectInputClose() { a.expectedClose.Store(true) }
 
 func NewApp(cfg *Config, log *Logger, out *Console, in *Input) *App {
 	a := &App{cfg: cfg, log: log, out: out, in: in, srv: map[string]*srvState{},
@@ -342,12 +353,12 @@ func cutWord(s string) (first, rest string) {
 func (a *App) doBreak(tok string) {
 	tok = strings.TrimSpace(tok)
 	if tok == "" {
-		a.out.Info("Использование: break <сервер>|<сервер1,сервер2>|all")
+		a.out.Warn("Использование: break <сервер>|<сервер1,сервер2>|all")
 		return
 	}
 	targets := a.parseTargets(tok)
 	if targets == nil {
-		a.out.Info("Неизвестный сервер %q", tok)
+		a.out.Warn("Неизвестный сервер %q", tok)
 		return
 	}
 	var hit []string
@@ -359,7 +370,7 @@ func (a *App) doBreak(tok string) {
 	}
 	switch len(hit) {
 	case 0:
-		a.out.Info("Нет активных подключений среди: %s", strings.Join(targets, ", "))
+		a.out.Warn("Нет активных подключений среди: %s", strings.Join(targets, ", "))
 	case 1:
 		a.out.Note(hit[0], "отправлен Ctrl+C")
 	default:
@@ -380,18 +391,22 @@ func (a *App) handleRunInput(text string) {
 	}
 	// «<сервер> <текст>» — ввод для команды на этом сервере.
 	if c := a.liveConn(first); c != nil {
-		if c.Busy() {
+		if c.ExecBusy() {
 			c.SendLine(rest)
 			a.out.Note(first, "-> ввод передан выполняющейся команде")
+		} else if c.Busy() {
+			a.out.Note(first, "идёт загрузка файла; прервать — break "+first)
 		} else {
 			a.out.Note(first, "сейчас ничего не выполняется; новые команды можно вводить после завершения шага")
 		}
 		return
 	}
-	// Иначе, если занят ровно один сервер, вся строка (в т.ч. пустая) адресуется ему.
+	// Иначе, если занят ровно один сервер shell-командой, вся строка (в т.ч.
+	// пустая) адресуется ему как ввод; загрузка файла тут не в счёт — ей
+	// нечего передавать на stdin, оболочка во время неё свободна.
 	var busy []string
 	for _, s := range a.cfg.Servers {
-		if c := a.liveConn(s.Name); c != nil && c.Busy() {
+		if c := a.liveConn(s.Name); c != nil && c.ExecBusy() {
 			busy = append(busy, s.Name)
 		}
 	}
@@ -400,7 +415,7 @@ func (a *App) handleRunInput(text string) {
 		a.out.Note(busy[0], "-> ввод передан выполняющейся команде")
 		return
 	}
-	a.out.Info("Идёт выполнение. Чтобы передать ввод команде, начните строку с имени сервера: «<сервер> <текст>»; «break <сервер>|all» — Ctrl+C.")
+	a.out.Warn("Идёт выполнение. Чтобы передать ввод команде, начните строку с имени сервера: «<сервер> <текст>»; «break <сервер>|all» — Ctrl+C.")
 }
 
 func (a *App) liveConn(name string) *Conn {
@@ -578,7 +593,11 @@ func (a *App) promptLoop() {
 		a.out.Prompt(a.promptText())
 		l, _ := a.in.Wait(nil)
 		if l.err != nil {
-			a.out.Info("Ввод закрыт, завершаю работу")
+			if a.expectedClose.Load() {
+				a.out.Info("Сессия закрыта: конфигурация сменена пользователем.")
+			} else {
+				a.out.Warn("Связь с программой неожиданно потеряна (возможно, закрыто консольное окно, из которого она запущена) — сессия завершена.")
+			}
 			a.quit = true
 			return
 		}
@@ -586,11 +605,11 @@ func (a *App) promptLoop() {
 		a.out.UserLine(text)
 		if text == "" {
 			if a.blocked != nil {
-				a.out.Info("Есть неустранённые ошибки — продолжать нельзя. retry / repeat / skip (help — справка).")
+				a.out.Warn("Есть неустранённые ошибки — продолжать нельзя. retry / repeat / skip (help — справка).")
 				continue
 			}
 			if a.cur >= len(a.cfg.Workflow) {
-				a.out.Info("Все шаги уже выполнены. Введите команду (help — справка) или quit для выхода.")
+				a.out.Warn("Все шаги уже выполнены. Введите команду (help — справка) или quit для выхода.")
 				continue
 			}
 			return
@@ -618,7 +637,7 @@ func (a *App) dispatch(text string) bool {
 	case "goto":
 		n, err := strconv.Atoi(rest)
 		if err != nil || n < 1 || n > len(a.cfg.Workflow) {
-			a.out.Info("Использование: goto <номер шага 1..%d>", len(a.cfg.Workflow))
+			a.out.Warn("Использование: goto <номер шага 1..%d>", len(a.cfg.Workflow))
 			break
 		}
 		a.st(func() {
@@ -634,7 +653,7 @@ func (a *App) dispatch(text string) bool {
 		case rest != "":
 			n, err := strconv.Atoi(rest)
 			if err != nil || n < 1 || n > len(a.cfg.Workflow) {
-				a.out.Info("Использование: repeat [номер шага 1..%d]", len(a.cfg.Workflow))
+				a.out.Warn("Использование: repeat [номер шага 1..%d]", len(a.cfg.Workflow))
 				return false
 			}
 			idx = n - 1
@@ -643,7 +662,7 @@ func (a *App) dispatch(text string) bool {
 		case a.last != nil:
 			idx = a.last.idx
 		default:
-			a.out.Info("Ещё ни один шаг не выполнялся")
+			a.out.Warn("Ещё ни один шаг не выполнялся")
 			return false
 		}
 		sr := a.newStepRun(idx)
@@ -652,7 +671,7 @@ func (a *App) dispatch(text string) bool {
 
 	case "retry":
 		if a.blocked == nil {
-			a.out.Info("Неустранённых ошибок нет. Чтобы выполнить шаг заново: repeat [N]")
+			a.out.Warn("Неустранённых ошибок нет. Чтобы выполнить шаг заново: repeat [N]")
 			break
 		}
 		a.out.Info("Продолжаю шаг %d с места остановки…", a.blocked.idx+1)
@@ -660,7 +679,7 @@ func (a *App) dispatch(text string) bool {
 
 	case "skip":
 		if a.blocked == nil {
-			a.out.Info("Пропускать нечего. Перейти к другому шагу: goto N")
+			a.out.Warn("Пропускать нечего. Перейти к другому шагу: goto N")
 			break
 		}
 		a.out.Info("Ошибки шага %d проигнорированы по решению пользователя", a.blocked.idx+1)
@@ -676,7 +695,7 @@ func (a *App) dispatch(text string) bool {
 	case "edit":
 		args := splitArgs(rest)
 		if len(args) != 2 || a.srv[args[0]] == nil {
-			a.out.Info("Использование: edit <сервер> <путь к файлу на сервере>")
+			a.out.Warn("Использование: edit <сервер> <путь к файлу на сервере>")
 			break
 		}
 		if a.OpenEditor != nil { // GUI: встроенный редактор
@@ -690,12 +709,12 @@ func (a *App) dispatch(text string) bool {
 	case "upload":
 		args := splitArgs(rest)
 		if len(args) != 3 {
-			a.out.Info("Использование: upload <сервер|сервер1,сервер2|all> <локальный путь> <путь на сервере>")
+			a.out.Warn("Использование: upload <сервер|сервер1,сервер2|all> <локальный путь> <путь на сервере>")
 			break
 		}
 		targets := a.parseTargets(args[0])
 		if targets == nil {
-			a.out.Info("Неизвестный сервер %q", args[0])
+			a.out.Warn("Неизвестный сервер %q", args[0])
 			break
 		}
 		act := Action{Kind: "upload", Upload: UploadCfg{Local: args[1], Remote: args[2]}}
@@ -703,7 +722,7 @@ func (a *App) dispatch(text string) bool {
 
 	case "all", "*":
 		if rest == "" {
-			a.out.Info("Использование: all <команда>")
+			a.out.Warn("Использование: all <команда>")
 			break
 		}
 		a.manual(a.allServers(), Action{Kind: "cmd", Cmd: rest})
@@ -711,12 +730,12 @@ func (a *App) dispatch(text string) bool {
 	default:
 		if targets := a.parseTargets(first); targets != nil {
 			if rest == "" {
-				a.out.Info("После имени сервера нужна команда: %s <команда>", first)
+				a.out.Warn("После имени сервера нужна команда: %s <команда>", first)
 				break
 			}
 			a.manual(targets, Action{Kind: "cmd", Cmd: rest})
 		} else {
-			a.out.Info("Неизвестная команда или сервер %q (help — справка)", first)
+			a.out.Warn("Неизвестная команда или сервер %q (help — справка)", first)
 		}
 	}
 	return false

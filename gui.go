@@ -368,6 +368,7 @@ func (g *GUI) unload() error {
 	if s == nil {
 		return errors.New("конфиг не загружен")
 	}
+	s.app.ExpectInputClose()
 	s.closeInput()
 	s.app.Shutdown() // не ждём окончания долгих команд
 	return nil

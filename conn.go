@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -46,9 +47,16 @@ type Conn struct {
 	curLine  string
 	answered bool
 
-	busySince time.Time // когда началась текущая команда (для GUI)
+	busySince time.Time // когда началась текущая команда/загрузка (для GUI)
 	busyCmd   string    // её краткий текст
 	onChange  func()    // вызывается при смене состояния (команда началась/закончилась, связь потеряна)
+
+	// Активная загрузка файла (SFTP) — отдельный от waiter признак «занят»,
+	// т.к. идёт по своему каналу и не управляется маркерами завершения команды.
+	// uploadCancel ненулевой ровно пока загрузка выполняется; Interrupt() вызывает
+	// именно его, если он есть, — так кнопки «Остановить»/команда break прерывают
+	// и загрузку файла точно так же, как обычную команду, без отдельного UI.
+	uploadCancel context.CancelFunc
 
 	execMu   sync.Mutex // одна команда за раз
 	closed   chan struct{}
@@ -191,7 +199,20 @@ func Connect(cfg ServerCfg, timeout time.Duration, sudo bool, out *Console, onCh
 }
 
 // Busy — выполняется ли сейчас команда (оболочка ещё не вернула ввод).
+// Busy — занято ли соединение чем бы то ни было (для статуса/кнопок в GUI).
 func (c *Conn) Busy() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.waiter != nil || c.uploadCancel != nil
+}
+
+// ExecBusy — выполняется ли именно shell-команда (не загрузка файла). Отдельно
+// от Busy(): во время загрузки PTY-оболочка на самом деле свободна (загрузка
+// идёт по своему SFTP-каналу), так что слать туда «ответ на вопрос программы»
+// было бы неверно — он просто выполнится как произвольная новая команда в обход
+// обычного механизма запуска. Для маршрутизации ручного ввода годится только
+// этот, более узкий признак.
+func (c *Conn) ExecBusy() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.waiter != nil
@@ -261,7 +282,28 @@ func (c *Conn) changed() {
 func (c *Conn) BusyInfo() (busy bool, since time.Time, cmd string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.waiter != nil, c.busySince, c.busyCmd
+	return c.waiter != nil || c.uploadCancel != nil, c.busySince, c.busyCmd
+}
+
+// startUpload помечает соединение «занятым» на время загрузки (busySince/busyCmd —
+// те же поля, что и для shell-команд, GUI не различает их природу) и возвращает
+// контекст, который Interrupt() отменит по запросу пользователя. done — обязательно
+// вызвать по завершении (и успешном, и с ошибкой), иначе соединение останется
+// видно как «занятое» навсегда.
+func (c *Conn) startUpload(label string) (ctx context.Context, done func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	c.mu.Lock()
+	c.uploadCancel = cancel
+	c.busySince, c.busyCmd = time.Now(), label
+	c.mu.Unlock()
+	c.changed()
+	return ctx, func() {
+		c.mu.Lock()
+		c.uploadCancel = nil
+		c.mu.Unlock()
+		cancel()
+		c.changed()
+	}
 }
 
 // completeUTF8 возвращает длину префикса b, не обрывающегося посреди UTF-8 символа.
@@ -476,7 +518,18 @@ func (c *Conn) exec(cmd string, timeout time.Duration) (int, error) {
 func (c *Conn) SendLine(s string) error { return c.writeStdin(s + "\n") }
 
 // Interrupt посылает Ctrl+C выполняющейся команде.
-func (c *Conn) Interrupt() error { return c.writeStdin("\x03") }
+// Interrupt прерывает то, что сейчас активно на соединении: идёт загрузка файла —
+// отменяет её; иначе — Ctrl+C выполняющейся shell-команде.
+func (c *Conn) Interrupt() error {
+	c.mu.Lock()
+	cancel := c.uploadCancel
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		return nil
+	}
+	return c.writeStdin("\x03")
+}
 
 func (c *Conn) Close() {
 	c.closing.Store(true)

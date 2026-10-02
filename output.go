@@ -248,9 +248,18 @@ func (c *Console) Err(name, format string, a ...any) {
 	c.line(name, "ERR", "!!! ОШИБКА: "+fmt.Sprintf(format, a...), true)
 }
 
-// Info — общее сообщение программы.
+// Info — общее сообщение программы (нейтральный статус).
 func (c *Console) Info(format string, a ...any) {
 	c.line("SYS", "SYS", fmt.Sprintf(format, a...), false)
+}
+
+// Warn — неудачная попытка пользователя: неверная команда, неизвестный сервер,
+// не те аргументы и т. п. Оформляется заметнее обычной Info, чтобы такое
+// сообщение не терялось на фоне рядовых статусных строк и не принималось
+// за «всё в порядке» — именно поэтому второй, уже пустой Enter следом за ним
+// по ошибке продвигал бы выполнение дальше.
+func (c *Console) Warn(format string, a ...any) {
+	c.line("SYS", "WARN", fmt.Sprintf(format, a...), false)
 }
 
 func (c *Console) Prompt(text string) {

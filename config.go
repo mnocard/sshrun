@@ -124,7 +124,7 @@ func (c *Config) HighlightEffective() (bool, []HighlightRule) {
 	return true, rules
 }
 
-var highlightKinds = map[string]bool{"out": true, "err": true, "sys": true, "info": true, "cmd": true, "in": true}
+var highlightKinds = map[string]bool{"out": true, "err": true, "sys": true, "info": true, "warn": true, "cmd": true, "in": true}
 
 // Action — одно атомарное действие на сервере.
 type Action struct {
