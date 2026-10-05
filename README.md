@@ -157,7 +157,7 @@ the server.
 
 | Field | Meaning |
 |---|---|
-| `log_file` | defaults to `sshrun.log` |
+| `log_file` | **not used** (kept only for backward compatibility with older configs — the value is parsed but ignored); the program computes the log file name itself, see the "Log" section below |
 | `connect_timeout` | seconds, defaults to 30 |
 | `default_sudo` | the password from the config is supplied to `sudo` prompts automatically; uploading/editing files without permission goes through sudo (a temp file + `sudo cp` / `sudo sh -c cat`) |
 | `pause_on_enter` | defaults to `true` — wait for an empty line after each step; `false` — steps run back to back, stopping only on error |
@@ -267,7 +267,14 @@ cancelled by the user" — you decide what to do next (`retry`/`repeat`/`skip`).
 
 ## Log
 
-Everything is written to `log_file` with a timestamp: server output
+The program computes the log file name itself: `sshrun-<login>-YYYYMMDD.log`,
+where `<login>` is the `username` of the **first** server in `servers[]`
+(characters not allowed in file names are replaced with `_`), and the date
+is today's, as `20261005`. The config's `log_file` field has no effect on
+this (see above). Running the program again the same day with the same
+first server appends to the same file, as before.
+
+Everything is written to that file with a timestamp: server output
 (`OUT`), commands (`CMD`), user input (`IN`), events (`SYS`), errors
 (`ERR`). Passwords never end up in the log. In graphical mode the log can be
 downloaded with a button in the window.

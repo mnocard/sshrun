@@ -50,6 +50,7 @@ func runCLI(path string, explicit bool) {
 		fmt.Fprintln(os.Stderr, "Ошибка конфигурации:", err)
 		os.Exit(2)
 	}
+	cfg.Settings.LogFile = ComputeLogFileName(cfg) // своё имя лога, значение из конфига игнорируется
 	logger, err := NewLogger(cfg.Settings.LogFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Не удалось открыть лог:", err)

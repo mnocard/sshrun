@@ -292,6 +292,7 @@ func (g *GUI) load(path string) error {
 		g.pushState()
 		return err
 	}
+	cfg.Settings.LogFile = ComputeLogFileName(cfg) // своё имя лога, значение из конфига игнорируется
 	logger, err := NewLogger(cfg.Settings.LogFile)
 	if err != nil {
 		err = fmt.Errorf("не удалось открыть лог %s: %w", cfg.Settings.LogFile, err)
@@ -305,7 +306,9 @@ func (g *GUI) load(path string) error {
 	}
 	g.broker.Reset()
 	lines := make(chan string, 256)
-	out := NewConsole(io.Discard, logger, names)
+	// os.Stdout — вывод одновременно идёт и в это окно браузера (через SetSink
+	// ниже), и в то консольное окно, из которого запущена программа.
+	out := NewConsole(os.Stdout, logger, names)
 	out.SetSink(g.broker.PublishEvent)
 	app := NewApp(cfg, logger, out, NewChanInput(lines))
 
@@ -426,6 +429,11 @@ func post(h http.HandlerFunc) http.HandlerFunc {
 func (g *GUI) guard(next http.Handler) http.Handler {
 	_, port, _ := net.SplitHostPort(g.addr)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Страница управляет реальными серверами — не даём встраивать её в <iframe>
+		// на постороннем сайте (clickjacking): проверка Host выше защищает от
+		// DNS-rebinding, но не от показа этой же страницы поверх чужой в iframe.
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
 		if r.Host != g.addr && r.Host != "localhost:"+port {
 			http.Error(w, "forbidden host", http.StatusForbidden)
 			return

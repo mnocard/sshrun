@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
+	"time"
 )
 
 type ServerCfg struct {
@@ -161,6 +163,25 @@ var reserved = map[string]bool{
 	"help": true, "steps": true, "list": true, "status": true, "quit": true, "exit": true,
 	"repeat": true, "goto": true, "retry": true, "skip": true, "break": true,
 	"edit": true, "upload": true, "all": true, "*": true, "servers": true, "hosts": true,
+}
+
+// logFileChars заменяет на "_" символы, запрещённые в имени файла хотя бы на
+// одной из платформ (жёстче правил Windows — так имя остаётся безопасным и там,
+// и на Linux/macOS). Логин пользователя может быть вида "user@domain.com" —
+// "@" и "." в имени файла допустимы везде, их не трогаем.
+var logFileChars = regexp.MustCompile(`[\\/:*?"<>|\x00-\x1f]`)
+
+// ComputeLogFileName — имя лог-файла по логину первого сервера в конфиге и
+// сегодняшней дате: sshrun-<логин>-ГГГГММДД.log. Значение log_file из самого
+// конфига сознательно не используется (см. README) — только читается при
+// разборе JSON, чтобы старые конфиги с этим полем не считались ошибочными.
+func ComputeLogFileName(cfg *Config) string {
+	user := "unknown"
+	if len(cfg.Servers) > 0 && cfg.Servers[0].Username != "" {
+		user = cfg.Servers[0].Username
+	}
+	user = logFileChars.ReplaceAllString(user, "_")
+	return fmt.Sprintf("sshrun-%s-%s.log", user, time.Now().Format("20060102"))
 }
 
 func LoadConfig(path string) (*Config, error) {
