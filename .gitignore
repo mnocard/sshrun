@@ -27,6 +27,13 @@ go.work.sum
 # env file
 .env
 
-# Editor/IDE
-# .idea/
-# .vscode/
+*.log
+/dist/
+sshrun
+sshrun.exe
+sshrun-*
+
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
