@@ -61,6 +61,8 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
 }
 .overlay .box.wide{width:820px}
 .overlay h2{margin:0 0 14px;font-size:16px}
+#bye-countdown{color:var(--dim);margin-top:10px}
+#bye-sec{color:var(--accent);font-weight:700;font-variant-numeric:tabular-nums}
 .err-box{
   background:#2a1418; border:1px solid var(--danger); color:#ffb3b3;
   border-radius:6px; padding:8px 10px; margin-bottom:12px; font-size:13px; white-space:pre-wrap;
@@ -179,6 +181,20 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
 #quickbar button.warn{border-color:var(--warn);color:var(--warn)}
 #quickbar button.danger{border-color:var(--danger);color:var(--danger)}
 .cmdrow{display:flex;gap:8px}
+.cmdinput-wrap{position:relative;flex:1}
+.cmdinput-wrap input{width:100%}
+.suggest-box{
+  position:absolute; left:0; right:0; bottom:calc(100% + 4px);
+  background:var(--panel2); border:1px solid var(--border); border-radius:8px;
+  max-height:220px; overflow:auto; box-shadow:0 8px 24px rgba(0,0,0,.4); z-index:20;
+}
+.suggest-item{
+  display:flex; align-items:center; gap:8px; padding:7px 10px; cursor:pointer; font-size:13px;
+}
+.suggest-item .tag{flex:0 0 auto}
+.suggest-item .addr{color:var(--dim);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.suggest-item.sel,.suggest-item:hover{background:var(--panel)}
+.suggest-item.sel{outline:1px solid var(--accent);outline-offset:-1px}
 #cmdinput{flex:1;font-family:ui-monospace,Consolas,monospace}
 
 /* ---- editor ---- */
@@ -236,7 +252,10 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
     <form id="cmdform">
       <div id="quickbar"></div>
       <div class="cmdrow">
-        <input id="cmdinput" autocomplete="off" placeholder="Enter — продолжить; или «сервер команда», upload, edit, repeat N, goto N…">
+        <div class="cmdinput-wrap">
+          <input id="cmdinput" autocomplete="off" placeholder="Enter — продолжить; или «сервер команда», upload, edit, repeat N, goto N…">
+          <div id="srv-suggest" class="suggest-box hidden"></div>
+        </div>
         <button type="submit">Отправить</button>
       </div>
     </form>
@@ -286,7 +305,8 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
 <div id="bye" class="overlay hidden">
   <div class="box">
     <h2>Программа завершена</h2>
-    <p class="dim">Все соединения с серверами закрыты. Это окно можно закрыть.</p>
+    <p class="dim">Все соединения с серверами закрыты.</p>
+    <p id="bye-countdown">Окно закроется через <span id="bye-sec">5</span> с…</p>
   </div>
 </div>
 
@@ -319,6 +339,7 @@ async function api(path, body){
 
 // ---------- глобальное состояние ----------
 let G = {loaded:false, configs:[], app:null, ui:null};
+let quitting = false; // «Выход» подтверждён — не мешаем закрытию beforeunload-диалогом
 let UI = {font_size:13, max_lines:20000, timestamps:true};
 let compiledRules = [];
 const openLine = new Map();      // server -> {el, txtEl} — незакрытая строка вывода
@@ -332,7 +353,7 @@ const pickerEl=el('picker'), pickerListEl=el('picker-list'), pickerErrorEl=el('p
       pickerPathEl=el('picker-path');
 const mainEl=el('main'), serversEl=el('servers'), stepsEl=el('steps'), consoleEl=el('console'),
       quickbarEl=el('quickbar'), cmdinputEl=el('cmdinput'), cmdformEl=el('cmdform'),
-      filterbarEl=el('filterbar');
+      filterbarEl=el('filterbar'), suggestEl=el('srv-suggest');
 const cfginfoEl=el('cfginfo'), connDotEl=el('conn-dot'), btnLogEl=el('btn-log'),
       btnSwitchEl=el('btn-switch'), btnQuitEl=el('btn-quit'), btnHelpEl=el('btn-help');
 const editorEl=el('editor'), editorServerSel=el('editor-server'), editorFileInput=el('editor-file'),
@@ -416,6 +437,7 @@ function resetConsole(){
   progressRows.clear();
   consoleFilter=null;
   renderFilterBar();
+  updateCmdPlaceholder();
   const note=document.createElement('div');
   note.className='line k-sys';
   note.innerHTML='<span class="txt dim">— новая сессия —</span>';
@@ -433,6 +455,14 @@ function setFilter(server){
     el2.style.display = lineVisible(el2.dataset.server) ? '' : 'none';
   }
   scrollMaybe();
+  updateCmdPlaceholder();
+}
+
+const DEFAULT_CMD_PLACEHOLDER = cmdinputEl.placeholder;
+function updateCmdPlaceholder(){
+  cmdinputEl.placeholder = consoleFilter
+    ? 'Текст без имени сервера уйдёт на «'+consoleFilter+'»; Enter — продолжить…'
+    : DEFAULT_CMD_PLACEHOLDER;
 }
 
 function renderFilterBar(){
@@ -629,11 +659,114 @@ quickbarEl.addEventListener('click', e=>{
   const btn=e.target.closest('button[data-cmd]');
   if(btn) sendCmd(btn.dataset.cmd);
 });
+// Глобальные команды программы — если строка начинается с одного из этих слов
+// (без учёта регистра, как и на бэкенде), фильтр по серверу её не трогает:
+// это обращение не к серверу, а к самой программе.
+const GLOBAL_COMMANDS = new Set(['help','?','steps','list','status','servers','hosts',
+  'quit','exit','goto','repeat','retry','skip','break','edit','upload','all','*']);
+
+// При активном фильтре по одному серверу строка без явного имени сервера
+// адресуется именно ему — набирать «dev » перед каждой командой не нужно.
+// Явное имя (в т.ч. другого сервера) и глобальные команды фильтр не трогает.
+function applyFilterPrefix(text){
+  if(!consoleFilter) return text;
+  const t = text.trim();
+  if(t==='') return text; // пустая строка — это «продолжить», не команда серверу
+  const first = t.split(/\s+/)[0];
+  const isKnownServer = (G.app && G.app.servers || []).some(s=>s.name===first);
+  if(isKnownServer || GLOBAL_COMMANDS.has(first.toLowerCase())) return text;
+  return consoleFilter+' '+text;
+}
+
 cmdformEl.addEventListener('submit', e=>{
   e.preventDefault();
-  const text=cmdinputEl.value;
+  const text=applyFilterPrefix(cmdinputEl.value);
   cmdinputEl.value='';
+  hideSuggest();
   sendCmd(text);
+});
+
+// ---------- подсказки имени сервера ----------
+let suggestItems=[], suggestIndex=-1;
+
+function computeSuggestions(){
+  const v = cmdinputEl.value;
+  if(v.indexOf(' ') !== -1) return null; // первое слово уже введено целиком — не наше дело
+  const q = v.toLowerCase();
+  const names = (G.app && G.app.servers || []).map(s=>s.name);
+  const pool = names.length > 1 ? names.concat(['all']) : names;
+  const matches = pool.filter(n => n.toLowerCase().startsWith(q));
+  if(!matches.length) return null;
+  if(q !== '' && matches.length===1 && matches[0].toLowerCase()===q) return null; // уже введено целиком
+  return matches;
+}
+function renderSuggest(){
+  const items = computeSuggestions();
+  if(!items || !items.length){ hideSuggest(); return; }
+  suggestItems = items;
+  suggestIndex = -1;
+  suggestEl.innerHTML = items.map(n=>{
+    if(n==='all'){
+      return '<div class="suggest-item" data-name="all"><span class="tag" style="background:var(--dim);color:#0a0d12">all</span><span class="addr">все серверы</span></div>';
+    }
+    const s = (G.app.servers||[]).find(x=>x.name===n);
+    const addr = s ? (esc(s.user)+'@'+esc(s.host)+':'+s.port) : '';
+    return '<div class="suggest-item" data-name="'+esc(n)+'"><span class="tag" style="'+tagStyle(n)+'">'+esc(n)+'</span><span class="addr">'+addr+'</span></div>';
+  }).join('');
+  suggestEl.classList.remove('hidden');
+}
+function hideSuggest(){
+  suggestEl.classList.add('hidden');
+  suggestEl.innerHTML='';
+  suggestItems=[]; suggestIndex=-1;
+}
+function applySuggestHighlight(){
+  [...suggestEl.children].forEach((el,i)=> el.classList.toggle('sel', i===suggestIndex));
+  const sel = suggestEl.children[suggestIndex];
+  if(sel && sel.scrollIntoView) sel.scrollIntoView({block:'nearest'});
+}
+function pickSuggestion(name){
+  cmdinputEl.value = name + ' ';
+  hideSuggest();
+  cmdinputEl.focus();
+}
+cmdinputEl.addEventListener('input', renderSuggest);
+cmdinputEl.addEventListener('focus', renderSuggest);
+cmdinputEl.addEventListener('blur', hideSuggest);
+cmdinputEl.addEventListener('keydown', e=>{
+  if(suggestEl.classList.contains('hidden') || !suggestItems.length) return;
+  if(e.key==='ArrowDown'){
+    e.preventDefault();
+    suggestIndex = (suggestIndex+1) % suggestItems.length;
+    applySuggestHighlight();
+  } else if(e.key==='ArrowUp'){
+    e.preventDefault();
+    suggestIndex = (suggestIndex-1+suggestItems.length) % suggestItems.length;
+    applySuggestHighlight();
+  } else if(e.key==='Enter'){
+    if(suggestIndex>=0){
+      e.preventDefault();
+      pickSuggestion(suggestItems[suggestIndex]);
+    } else {
+      hideSuggest();
+    }
+  } else if(e.key==='Tab'){
+    if(suggestIndex>=0 || suggestItems.length===1){
+      e.preventDefault();
+      pickSuggestion(suggestItems[suggestIndex>=0 ? suggestIndex : 0]);
+    }
+  } else if(e.key==='Escape'){
+    hideSuggest();
+  }
+});
+// mousedown — не click: preventDefault здесь не даёт полю потерять фокус (и тем
+// самым скрыть список по blur) раньше, чем успеет сработать сам клик по пункту.
+suggestEl.addEventListener('mousedown', e=>{
+  if(e.target.closest('.suggest-item')) e.preventDefault();
+});
+suggestEl.addEventListener('click', e=>{
+  const item=e.target.closest('.suggest-item');
+  if(item) pickSuggestion(item.dataset.name);
 });
 async function sendCmd(text){
   try{ await api('/api/cmd', {text}); }
@@ -771,6 +904,32 @@ function updateGuiState(g){
 }
 
 // ---------- поток событий ----------
+// После «Выход» — отсчёт 5 секунд, затем попытка закрыть окно самостоятельно.
+// Браузеры не обязаны выполнять window.close() для окна, которое не было
+// открыто скриптом (window.open) — у sshrun оно открывается отдельным
+// процессом браузера в режиме --app, так что гарантии нет. Если через
+// полсекунды после попытки окно всё ещё здесь — честно говорим об этом
+// вместо того, чтобы вечно показывать «0 с».
+function startByeCountdown(){
+  const secEl = document.getElementById('bye-sec');
+  const msgEl = document.getElementById('bye-countdown');
+  let sec = 5;
+  if(secEl) secEl.textContent = sec;
+  const iv = setInterval(()=>{
+    sec--;
+    if(sec <= 0){
+      clearInterval(iv);
+      if(msgEl) msgEl.textContent = 'Закрываю окно…';
+      window.close();
+      setTimeout(()=>{
+        if(msgEl) msgEl.textContent = 'Закрыть окно автоматически не удалось — закройте его самостоятельно.';
+      }, 500);
+      return;
+    }
+    if(secEl) secEl.textContent = sec;
+  }, 1000);
+}
+
 function connectSSE(){
   const es=new EventSource('/api/events');
   es.addEventListener('state', e=>updateGuiState(JSON.parse(e.data)));
@@ -780,13 +939,29 @@ function connectSSE(){
     if(m.action==='edit') openEditor(m.server, m.path);
   });
   es.addEventListener('bye', ()=>{
+    quitting = true;
     byeEl.classList.remove('hidden');
     es.close();
+    startByeCountdown();
   });
   es.onmessage=e=>appendEvent(JSON.parse(e.data));
   es.onopen=()=>connDotEl.classList.add('on');
   es.onerror=()=>connDotEl.classList.remove('on');
 }
+
+// Ctrl+W (и закрытие вкладки/окна любым другим способом) веб-страница
+// перехватить и отменить не может — это сознательное ограничение браузера,
+// обойти его нечем. Единственное, что доступно, — спросить подтверждение
+// через стандартный диалог beforeunload: текст в нём браузер игнорирует и
+// показывает свой, сам факт показа — это максимум, что можно сделать.
+// Не показываем его, если конфиг ещё не загружен (предупреждать не о чем)
+// или если пользователь уже подтвердил «Выход» — иначе диалог всплывёт
+// ещё раз прямо на собственной попытке программы закрыть окно.
+window.addEventListener('beforeunload', (e)=>{
+  if(quitting || !G.loaded) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
 
 (async function boot(){
   try{
